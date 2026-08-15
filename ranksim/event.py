@@ -20,8 +20,23 @@ surrogate team's own ranking, and are excluded here accordingly.
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Team ids that differ between sources, seeded from data/aliases.json. Kept
+# separate from the CSV reconciliation because it is a fact about team identity,
+# not about the standings file -- CI builds without the CSV.
+ALIASES_PATH = Path(__file__).resolve().parent.parent / "data" / "aliases.json"
+
+
+def load_aliases(path: Path = ALIASES_PATH) -> dict[str, str]:
+    if not Path(path).exists():
+        return {}
+    try:
+        return dict(json.loads(Path(path).read_text()).get("aliases", {}))
+    except (json.JSONDecodeError, AttributeError):
+        return {}
 
 WIN_RP = 3
 TIE_RP = 1
@@ -235,6 +250,13 @@ def build_state(
                     r.dq += team in dq
         matches.append(match)
 
+    known = set(records)
+    seeded = {
+        source: target
+        for source, target in load_aliases().items()
+        if target in known and source not in known
+    }
+
     state = EventState(
         event_key=event_key,
         event_name=event_name,
@@ -243,6 +265,7 @@ def build_state(
         results=results,
         records=records,
         raw_matches=quals,
+        csv_aliases=seeded,
     )
     if csv_path and Path(csv_path).exists():
         _attach_csv(state, Path(csv_path))
@@ -278,9 +301,13 @@ def _attach_csv(state: EventState, csv_path: Path) -> None:
                 played=int(row["Played"]),
             )
 
-    aliases: dict[str, str] = {}
-    csv_only = [t for t in rows if t not in state.records]
-    tba_only = [t for t in state.records if t not in rows]
+    # Aliases seeded from data/aliases.json already account for both sides of the
+    # pair, so neither end should be reported as missing.
+    aliases: dict[str, str] = dict(state.csv_aliases)
+    csv_only = [t for t in rows if t not in state.records and t not in aliases]
+    tba_only = [
+        t for t in state.records if t not in rows and t not in set(aliases.values())
+    ]
 
     def signature(rec: TeamRecord) -> tuple:
         return (rec.played, rec.rp, rec.wins, rec.losses, rec.ties, rec.match_points)

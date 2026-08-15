@@ -1,0 +1,103 @@
+name: Deploy to GitHub Pages
+
+# Publishes web/ to Pages with a freshly pulled bundle.
+#
+# The site is static and does the fitting and simulation in the browser, so the
+# only build step is regenerating web/data/event.json -- and that is the one part
+# that needs the TBA API key, which is why it happens here rather than in the
+# page. Scouting is fetched live by the page from the deployed scoutinapp and is
+# never baked, so it stays current without a redeploy.
+#
+# Setup, once:
+#   1. Settings > Secrets and variables > Actions > New repository secret
+#      Name: TBA_API_KEY   Value: your key from thebluealliance.com/account
+#   2. Settings > Pages > Build and deployment > Source: GitHub Actions
+#   3. Run this workflow (Actions tab > Deploy to GitHub Pages > Run workflow)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # During an event, results change every few minutes. Disable this outside one:
+  # scheduled runs cost Actions minutes and GitHub suspends them after 60 days
+  # of repo inactivity anyway.
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; queue instead of cancelling, so a scheduled run
+# cannot discard a push someone is waiting on.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # The model exists twice -- ranksim/model.py and web/lib/model.js -- and the
+      # browser runs the JS one. Publishing a build where they disagree would ship
+      # numbers that no test has ever checked, so the parity suite gates the deploy.
+      - name: Test
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Build the event bundle
+        env:
+          TBA_API_KEY: ${{ secrets.TBA_API_KEY }}
+        run: |
+          if [ -z "$TBA_API_KEY" ]; then
+            echo "::error::TBA_API_KEY secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          python3 sim.py export
+
+      # A silent fall back to the committed bundle would publish stale standings
+      # that look live. Fail loudly instead.
+      - name: Verify the bundle is a live pull
+        run: |
+          python3 - <<'PY'
+          import json, sys, time
+          data = json.load(open("web/data/event.json"))
+          source = data.get("tbaSource")
+          print(f"tbaSource={source}")
+          print(f"played={data['event']['matchesPlayed']} remaining={data['event']['matchesRemaining']}")
+          for warning in data.get("tbaWarnings", []):
+              print(f"::warning::{warning}")
+          if source != "tba":
+              print("::error::bundle was not built from a live TBA pull")
+              sys.exit(1)
+          age = time.time() - data["generatedAt"]
+          if age > 600:
+              print(f"::error::bundle timestamp is {age:.0f}s old")
+              sys.exit(1)
+          PY
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

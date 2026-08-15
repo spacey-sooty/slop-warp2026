@@ -61,16 +61,28 @@ priors were frozen at export time, the refresh button would be cosmetic.
 
 ### Deploying
 
-Point any static host at `web/`. A `vercel.json` is included, so:
+**GitHub Pages** (`.github/workflows/deploy.yml`) is set up. It regenerates the
+bundle from a live TBA pull, gates on the test suite, and publishes `web/`. Two
+one-time steps before the first run:
 
-```
-npx vercel deploy --prod     # from event-sims/
-```
+1. **Settings → Secrets and variables → Actions →** add `TBA_API_KEY`
+   (from [thebluealliance.com/account](https://www.thebluealliance.com/account)).
+2. **Settings → Pages → Source: GitHub Actions.**
 
-To keep results current during an event, re-run `./sim.py export` and redeploy
-after matches — a cron or GitHub Action on a ~5 minute schedule is enough, and
-**Refresh TBA** in the deployed page then picks the new bundle up without a
-reload. Scouting never needs a redeploy.
+Then push, or run it from the Actions tab. It also runs every 15 minutes so
+results stay current during an event — drop the `schedule:` block once the event
+is over.
+
+The workflow **fails rather than publishing stale data**: if the TBA pull falls
+back to cache, or the bundle is more than 10 minutes old, the deploy stops. A
+site that quietly shows yesterday's standings is worse than one that visibly
+failed to update.
+
+Any other static host works too — point it at `web/`. A `vercel.json` is
+included for `npx vercel deploy --prod`.
+
+Relative URLs throughout, so serving from a subpath
+(`user.github.io/repo/`) works without configuration.
 
 ### Two implementations, one model
 

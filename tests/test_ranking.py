@@ -25,11 +25,13 @@ from ranksim.loader import (  # noqa: E402
 from ranksim.scouting import TIER_ORDER, build as build_scouting  # noqa: E402
 from ranksim.simulate import SimOptions, simulate  # noqa: E402
 
-CACHE = ROOT / "cache" / DEFAULT_EVENT
+# Committed fixtures, so the suite is hermetic and CI needs no warm cache.
+FIXTURES = ROOT / "tests" / "fixtures"
+CACHE = FIXTURES / DEFAULT_EVENT
 
 
 def load_state():
-    return load_event(DEFAULT_EVENT, csv_path=DEFAULT_CSV, offline=True)
+    return load_event(DEFAULT_EVENT, csv_path=DEFAULT_CSV, offline=True, cache_dir=FIXTURES)
 
 
 class RankingRules(unittest.TestCase):
@@ -142,7 +144,7 @@ class Simulation(unittest.TestCase):
 class ScoutingIntegration(unittest.TestCase):
     def setUp(self):
         self.state = load_state()
-        self.scouting, error = load_scouting(self.state, offline=True)
+        self.scouting, error = load_scouting(self.state, offline=True, cache_dir=FIXTURES)
         if self.scouting is None:
             self.skipTest(f"no cached scouting dump: {error}")
 

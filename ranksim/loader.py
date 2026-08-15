@@ -20,8 +20,10 @@ def load_event(
     csv_path: Path | None = None,
     offline: bool = False,
     refresh: bool = False,
+    cache_dir: Path | None = None,
 ) -> EventState:
-    client = TBAClient(cache_dir=CACHE_DIR / event_key, offline=offline)
+    root = Path(cache_dir) if cache_dir else CACHE_DIR
+    client = TBAClient(cache_dir=root / event_key, offline=offline)
     try:
         event = client.event(event_key, force=refresh)
         name = event.get("name", event_key)
@@ -40,6 +42,7 @@ def load_scouting(
     url: str = SCOUTING_URL,
     offline: bool = False,
     refresh: bool = False,
+    cache_dir: Path | None = None,
 ) -> tuple[Scouting | None, str | None]:
     """Returns (scouting, error). A missing scouting export is not fatal --
     the simulator falls back to the on-field fit alone."""
@@ -47,7 +50,7 @@ def load_scouting(
         data = load_scouting_data(
             state,
             url=url,
-            cache_dir=CACHE_DIR / state.event_key,
+            cache_dir=(Path(cache_dir) if cache_dir else CACHE_DIR) / state.event_key,
             offline=offline,
             refresh=refresh,
         )

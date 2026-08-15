@@ -1,0 +1,18 @@
+{
+  "_comment": [
+    "Team ids that differ between data sources, as source-id -> TBA-id.",
+    "TBA is the authority; the scouting app and the standings CSV both key teams",
+    "by plain number, so a B-team has nowhere to put its letter.",
+    "",
+    "2026auwarp: scoutinapp and event-rankings.csv both call 4788's B-team '9982'.",
+    "Its nickname there is 'Can't Control Pro Max' to 4788's 'Can't Control'.",
+    "",
+    "This lives here rather than being derived from the CSV because it is a fact",
+    "about team identity, not about the standings file. CI builds the site without",
+    "the CSV, and deriving it there stranded all 15 of 4788B's scouting reports",
+    "under an id nothing matched."
+  ],
+  "aliases": {
+    "9982": "4788B"
+  }
+}

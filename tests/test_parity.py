@@ -15,6 +15,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -31,7 +32,9 @@ from ranksim.loader import (  # noqa: E402
 )
 from ranksim.event import rank_teams  # noqa: E402
 
-CACHE = ROOT / "cache" / DEFAULT_EVENT
+# Committed fixtures, so the suite is hermetic and CI needs no warm cache.
+FIXTURES = ROOT / "tests" / "fixtures"
+CACHE = FIXTURES / DEFAULT_EVENT
 TOLERANCE = 1e-9
 
 
@@ -44,11 +47,15 @@ class Parity(unittest.TestCase):
     def setUpClass(cls):
         if not js_available():
             raise unittest.SkipTest("node not installed")
-        cls.state = load_event(DEFAULT_EVENT, csv_path=DEFAULT_CSV, offline=True)
-        cls.scouting, _ = load_scouting(cls.state, offline=True)
+        cls.state = load_event(
+            DEFAULT_EVENT, csv_path=DEFAULT_CSV, offline=True, cache_dir=FIXTURES
+        )
+        cls.scouting, _ = load_scouting(cls.state, offline=True, cache_dir=FIXTURES)
         cls.bundle = build_bundle(cls.state)
 
-        bundle_path = ROOT / "cache" / "_parity_bundle.json"
+        # A real temp dir, not cache/ -- a clean checkout has no cache/ at all.
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        bundle_path = Path(cls._tmpdir.name) / "bundle.json"
         bundle_path.write_text(json.dumps(cls.bundle))
         scouting_path = CACHE / "scouting.json"
         cls.bundle_path = bundle_path
@@ -75,8 +82,9 @@ class Parity(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if getattr(cls, "bundle_path", None) and cls.bundle_path.exists():
-            cls.bundle_path.unlink()
+        tmp = getattr(cls, "_tmpdir", None)
+        if tmp is not None:
+            tmp.cleanup()
 
     def assert_fit_matches(self, py_fit, js):
         summary = js["fit"]

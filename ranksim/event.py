@@ -1,0 +1,338 @@
+"""Event state: the qual schedule, the current standings, and the ranking rules.
+
+Ranking rules for the 2026 game, reverse-engineered from TBA score breakdowns and
+verified against six 2026 events (0 mismatches over 461 qual matches):
+
+  Ranking points   3 win / 1 tie / 0 loss, plus one RP each for the
+                   Energized, Supercharged and Traversal achievements.
+  Match points     alliance totalPoints minus foulPoints (fouls the opponent
+                   committed count toward winning the match but not toward the
+                   ranking tiebreaker).
+  Avg Auto Fuel    hubScore.autoPoints.
+  Avg Tower        totalTowerPoints.
+  Sort             Ranking Score (RP/played), then Avg Match, Avg Auto Fuel,
+                   Avg Tower -- all averages over counting matches.
+
+Surrogate appearances score for the alliance but do not count toward the
+surrogate team's own ranking, and are excluded here accordingly.
+"""
+
+from __future__ import annotations
+
+import csv
+from dataclasses import dataclass, field
+from pathlib import Path
+
+WIN_RP = 3
+TIE_RP = 1
+
+# Per-robot tower values, read off the breakdowns (endgame Level1/2/3 = 10/20/30,
+# auto Level1 = 15; auto Level2/3 never appeared in 2026 data, extrapolated).
+AUTO_TOWER_VALUE = {"None": 0, "Level1": 15, "Level2": 30, "Level3": 45}
+ENDGAME_TOWER_VALUE = {"None": 0, "Level1": 10, "Level2": 20, "Level3": 30}
+
+SORT_KEYS = ("rank_score", "avg_match", "avg_auto", "avg_tower")
+
+
+@dataclass
+class TeamRecord:
+    team: str
+    rp: int = 0
+    match_points: int = 0
+    auto_fuel: int = 0
+    tower: int = 0
+    wins: int = 0
+    losses: int = 0
+    ties: int = 0
+    dq: int = 0
+    played: int = 0
+
+    def copy(self) -> "TeamRecord":
+        return TeamRecord(**vars(self))
+
+    @property
+    def sort_orders(self) -> tuple[float, float, float, float]:
+        n = self.played or 1
+        return (self.rp / n, self.match_points / n, self.auto_fuel / n, self.tower / n)
+
+    def as_dict(self) -> dict:
+        rs, am, aa, at = self.sort_orders
+        return {
+            "team": self.team,
+            "rp": self.rp,
+            "matchPoints": self.match_points,
+            "autoFuel": self.auto_fuel,
+            "tower": self.tower,
+            "wins": self.wins,
+            "losses": self.losses,
+            "ties": self.ties,
+            "played": self.played,
+            "rankScore": rs,
+            "avgMatch": am,
+            "avgAuto": aa,
+            "avgTower": at,
+        }
+
+
+@dataclass
+class Match:
+    key: str
+    number: int
+    red: list[str]
+    blue: list[str]
+    red_surrogates: set[str] = field(default_factory=set)
+    blue_surrogates: set[str] = field(default_factory=set)
+    played: bool = False
+    # Populated for played matches.
+    winner: str = ""  # "red" | "blue" | "" (tie)
+    breakdown: dict = field(default_factory=dict)
+
+    def alliance(self, color: str) -> list[str]:
+        return self.red if color == "red" else self.blue
+
+    def counting(self, color: str) -> list[str]:
+        sur = self.red_surrogates if color == "red" else self.blue_surrogates
+        return [t for t in self.alliance(color) if t not in sur]
+
+    def as_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "number": self.number,
+            "red": self.red,
+            "blue": self.blue,
+            "redSurrogates": sorted(self.red_surrogates),
+            "blueSurrogates": sorted(self.blue_surrogates),
+            "played": self.played,
+            "winner": self.winner,
+        }
+
+
+@dataclass
+class AllianceResult:
+    """One played alliance-appearance, the unit the model is fitted on."""
+
+    match_key: str
+    color: str
+    teams: list[str]
+    counting_teams: list[str]
+    hub_points: int
+    hub_auto: int
+    tower_points: int
+    foul_points: int
+    total_points: int
+    match_points: int
+    rp: int
+    energized: bool
+    supercharged: bool
+    traversal: bool
+    auto_tower_levels: list[str]
+    endgame_tower_levels: list[str]
+    won: bool
+    tied: bool
+
+
+def team_num(team_key: str) -> str:
+    """'frc4788B' -> '4788B'."""
+    return team_key[3:] if team_key.startswith("frc") else team_key
+
+
+@dataclass
+class EventState:
+    event_key: str
+    event_name: str
+    teams: list[str]
+    matches: list[Match]
+    results: list[AllianceResult]
+    records: dict[str, TeamRecord]
+    csv_records: dict[str, TeamRecord] | None = None
+    csv_aliases: dict[str, str] = field(default_factory=dict)
+    csv_discrepancies: list[str] = field(default_factory=list)
+    raw_matches: list[dict] = field(default_factory=list)
+    # "tba" if this pull reached TBA, "cache"/"stale-cache" if it did not.
+    tba_source: str = "cache"
+    tba_warnings: list[str] = field(default_factory=list)
+
+    @property
+    def remaining(self) -> list[Match]:
+        return [m for m in self.matches if not m.played]
+
+    @property
+    def played(self) -> list[Match]:
+        return [m for m in self.matches if m.played]
+
+
+def _alliance_result(match: dict, color: str) -> AllianceResult:
+    alliance = match["alliances"][color]
+    breakdown = match["score_breakdown"][color]
+    hub = breakdown["hubScore"]
+    teams = [team_num(t) for t in alliance["team_keys"]]
+    sur = {team_num(t) for t in alliance["surrogate_team_keys"]}
+    return AllianceResult(
+        match_key=match["key"],
+        color=color,
+        teams=teams,
+        counting_teams=[t for t in teams if t not in sur],
+        hub_points=hub["totalPoints"],
+        hub_auto=hub["autoPoints"],
+        tower_points=breakdown["totalTowerPoints"],
+        foul_points=breakdown["foulPoints"],
+        total_points=breakdown["totalPoints"],
+        match_points=breakdown["totalPoints"] - breakdown["foulPoints"],
+        rp=breakdown["rp"],
+        energized=bool(breakdown["energizedAchieved"]),
+        supercharged=bool(breakdown["superchargedAchieved"]),
+        traversal=bool(breakdown["traversalAchieved"]),
+        auto_tower_levels=[breakdown[f"autoTowerRobot{i}"] for i in (1, 2, 3)],
+        endgame_tower_levels=[breakdown[f"endGameTowerRobot{i}"] for i in (1, 2, 3)],
+        won=match["winning_alliance"] == color,
+        tied=match["winning_alliance"] == "",
+    )
+
+
+def build_state(
+    event_key: str, event_name: str, raw_matches: list[dict], csv_path: Path | None = None
+) -> EventState:
+    quals = [m for m in raw_matches if m["comp_level"] == "qm"]
+    quals.sort(key=lambda m: m["match_number"])
+
+    matches: list[Match] = []
+    results: list[AllianceResult] = []
+    records: dict[str, TeamRecord] = {}
+
+    def record(team: str) -> TeamRecord:
+        return records.setdefault(team, TeamRecord(team))
+
+    for raw in quals:
+        red = [team_num(t) for t in raw["alliances"]["red"]["team_keys"]]
+        blue = [team_num(t) for t in raw["alliances"]["blue"]["team_keys"]]
+        match = Match(
+            key=raw["key"],
+            number=raw["match_number"],
+            red=red,
+            blue=blue,
+            red_surrogates={team_num(t) for t in raw["alliances"]["red"]["surrogate_team_keys"]},
+            blue_surrogates={team_num(t) for t in raw["alliances"]["blue"]["surrogate_team_keys"]},
+            played=bool(raw.get("score_breakdown")),
+        )
+        for team in red + blue:
+            record(team)
+        if match.played:
+            match.winner = raw["winning_alliance"]
+            for color in ("red", "blue"):
+                res = _alliance_result(raw, color)
+                results.append(res)
+                dq = {team_num(t) for t in raw["alliances"][color]["dq_team_keys"]}
+                for team in res.counting_teams:
+                    r = record(team)
+                    r.played += 1
+                    r.rp += res.rp
+                    r.match_points += res.match_points
+                    r.auto_fuel += res.hub_auto
+                    r.tower += res.tower_points
+                    r.wins += res.won
+                    r.ties += res.tied
+                    r.losses += not (res.won or res.tied)
+                    r.dq += team in dq
+        matches.append(match)
+
+    state = EventState(
+        event_key=event_key,
+        event_name=event_name,
+        teams=sorted(records, key=_team_sort_key),
+        matches=matches,
+        results=results,
+        records=records,
+        raw_matches=quals,
+    )
+    if csv_path and Path(csv_path).exists():
+        _attach_csv(state, Path(csv_path))
+    return state
+
+
+def _team_sort_key(team: str) -> tuple[int, str]:
+    digits = "".join(c for c in team if c.isdigit())
+    return (int(digits) if digits else 0, team)
+
+
+def _attach_csv(state: EventState, csv_path: Path) -> None:
+    """Load the hand-supplied standings CSV and reconcile its team ids with TBA's.
+
+    The CSV that ships with this event lists a team as `9982` where TBA has
+    `4788B`, so ids that appear on only one side are matched up by their ranking
+    row (played/RP/W/L) instead of being dropped.
+    """
+    rows: dict[str, TeamRecord] = {}
+    with csv_path.open() as fh:
+        for row in csv.DictReader(fh):
+            team = row["TeamId"].strip()
+            rows[team] = TeamRecord(
+                team=team,
+                rp=int(row["RankingPoints"]),
+                match_points=int(row["MatchPoints"]),
+                auto_fuel=int(row["AutoFuelPoints"]),
+                tower=int(row["TowerPoints"]),
+                wins=int(row["Wins"]),
+                losses=int(row["Losses"]),
+                ties=int(row["Ties"]),
+                dq=int(row["Disqualifications"]),
+                played=int(row["Played"]),
+            )
+
+    aliases: dict[str, str] = {}
+    csv_only = [t for t in rows if t not in state.records]
+    tba_only = [t for t in state.records if t not in rows]
+
+    def signature(rec: TeamRecord) -> tuple:
+        return (rec.played, rec.rp, rec.wins, rec.losses, rec.ties, rec.match_points)
+
+    for csv_team in list(csv_only):
+        sig = signature(rows[csv_team])
+        hits = [t for t in tba_only if signature(state.records[t]) == sig]
+        if len(hits) == 1:
+            aliases[csv_team] = hits[0]
+            tba_only.remove(hits[0])
+            csv_only.remove(csv_team)
+
+    canonical: dict[str, TeamRecord] = {}
+    for csv_team, rec in rows.items():
+        target = aliases.get(csv_team, csv_team)
+        rec.team = target
+        canonical[target] = rec
+
+    discrepancies: list[str] = []
+    for team in csv_only:
+        discrepancies.append(f"{team}: in CSV but not in the TBA schedule")
+    for team in tba_only:
+        discrepancies.append(f"{team}: in the TBA schedule but not in the CSV")
+    for team, rec in canonical.items():
+        live = state.records.get(team)
+        if live is None:
+            continue
+        for label, a, b in (
+            ("played", rec.played, live.played),
+            ("RP", rec.rp, live.rp),
+            ("match points", rec.match_points, live.match_points),
+            ("auto fuel", rec.auto_fuel, live.auto_fuel),
+            ("tower", rec.tower, live.tower),
+            ("record", (rec.wins, rec.losses, rec.ties), (live.wins, live.losses, live.ties)),
+        ):
+            if a != b:
+                discrepancies.append(f"{team}: CSV {label} {a} vs TBA {b}")
+
+    state.csv_records = canonical
+    state.csv_aliases = aliases
+    state.csv_discrepancies = discrepancies
+
+
+def rank_teams(records: dict[str, TeamRecord]) -> list[str]:
+    """Teams in official ranking order (best first)."""
+    return sorted(
+        records,
+        key=lambda t: (
+            -records[t].sort_orders[0],
+            -records[t].sort_orders[1],
+            -records[t].sort_orders[2],
+            -records[t].sort_orders[3],
+            _team_sort_key(t),
+        ),
+    )

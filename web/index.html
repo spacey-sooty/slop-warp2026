@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ranking simulator</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <h1 id="event-name">Loading…</h1>
+      <p class="subtitle" id="event-sub"></p>
+    </div>
+    <div style="display:flex; gap:8px;">
+      <button class="ghost-btn" id="tba-btn">Refresh TBA</button>
+      <span class="pill hidden" id="tba-status"></span>
+      <button class="ghost-btn" id="refresh-btn" title="Re-pull pit scouting from the live scoutinapp deployment and refit">Refresh scouting</button>
+      <span class="pill hidden" id="scouting-status"></span>
+      <button class="ghost-btn" id="theme-btn" aria-label="Toggle colour theme">Theme</button>
+    </div>
+  </header>
+
+  <div class="notice hidden" id="notice"></div>
+
+  <div class="controls">
+    <div class="field">
+      <label for="trials">Trials</label>
+      <select id="trials">
+        <option value="1000">1,000</option>
+        <option value="5000" selected>5,000</option>
+        <option value="20000">20,000</option>
+        <option value="50000">50,000</option>
+        <option value="200000">200,000</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="cutoff">Cutoff rank</label>
+      <input type="number" id="cutoff" min="1" max="27" value="8">
+    </div>
+    <div class="field">
+      <label for="seed">Seed</label>
+      <input type="number" id="seed" placeholder="random">
+    </div>
+    <label class="checkfield">
+      <input type="checkbox" id="uncertainty" checked>
+      Include rating uncertainty
+    </label>
+    <label class="checkfield" id="scouting-field">
+      <input type="checkbox" id="scouting" checked>
+      Use pit scouting
+    </label>
+    <button class="primary" id="run-btn">Run simulation</button>
+    <button class="ghost-btn hidden" id="reset-btn">Clear scenario</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <div class="section-head">
+      <h2>Projected final standings</h2>
+      <span class="section-note">Click a team for its full distribution. Click a column to sort.</span>
+    </div>
+    <div class="card scroll-x">
+      <table id="standings">
+        <thead><tr id="standings-head"></tr></thead>
+        <tbody id="standings-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Rank probability</h2>
+      <span class="section-note">Chance each team finishes at each rank</span>
+    </div>
+    <div class="card heatmap">
+      <div class="legend" id="heat-legend"></div>
+      <div class="scroll-x">
+        <div class="heat-grid" id="heat-grid"></div>
+      </div>
+      <div class="heat-axis-title">Final rank</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Remaining matches</h2>
+      <span class="section-note">Force an outcome to explore a what-if scenario</span>
+    </div>
+    <div class="matchlist" id="matchlist"></div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Model</h2>
+      <span class="section-note">Fitted from this event's played qualification matches</span>
+    </div>
+    <div class="card" style="padding:14px 16px;">
+      <p class="section-note" id="model-summary" style="margin:0 0 12px;"></p>
+      <div class="scroll-x">
+        <table id="model-table">
+          <thead><tr>
+            <th class="left">Team</th>
+            <th>Hub OPR</th>
+            <th>± SE</th>
+            <th title="Change in hub OPR from folding in the scouting priors">Δ scouting</th>
+            <th title="Median balls per match across this team's pit reports">Scouted balls</th>
+            <th>Auto fuel OPR</th>
+            <th>Climb rate</th>
+            <th>E[tower]</th>
+          </tr></thead>
+          <tbody id="model-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="detail" id="detail" aria-hidden="true"></aside>
+<div class="tooltip" id="tooltip" role="status"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

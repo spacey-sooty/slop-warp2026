@@ -14,7 +14,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from ranksim.event import TIE_RP, WIN_RP, rank_teams, team_num  # noqa: E402
+from ranksim.event import (  # noqa: E402
+    TIE_RP,
+    WIN_RP,
+    published_mismatches,
+    rank_teams,
+    team_num,
+)
 from ranksim.loader import (  # noqa: E402
     DEFAULT_CSV,
     DEFAULT_EVENT,
@@ -56,6 +62,23 @@ class RankingRules(unittest.TestCase):
                 for got, want in zip(record.sort_orders, row["sort_orders"]):
                     # TBA publishes the sort orders at single precision.
                     self.assertAlmostEqual(got, want, delta=1e-6 + abs(want) * 1e-6)
+
+    def test_published_check_agrees(self):
+        """The helper the CLI and the page both report from finds no fault."""
+        self.assertIsNotNone(self.state.tba_rankings)
+        self.assertEqual(published_mismatches(self.state.records, self.state.tba_rankings), [])
+
+    def test_published_check_catches_a_wrong_rebuild(self):
+        """...and would say so if the rules here drifted from the real ones."""
+        broken = {t: r.copy() for t, r in self.state.records.items()}
+        leader = rank_teams(broken)[0]
+        broken[leader].rp -= 6
+        mismatches = published_mismatches(broken, self.state.tba_rankings)
+        self.assertTrue(mismatches)
+        self.assertTrue(any(leader in m and "rp" in m for m in mismatches))
+
+    def test_published_check_is_skipped_without_a_reference(self):
+        self.assertIsNone(published_mismatches(self.state.records, None))
 
     def test_rp_formula(self):
         """3/1/0 plus one RP per achievement reproduces every breakdown's rp."""
@@ -283,6 +306,53 @@ class Bundle(unittest.TestCase):
         self.assertEqual(len(data["results"]), len(state.results))
         self.assertEqual(len(data["remaining"]), len(state.remaining))
         self.assertEqual(set(data["standings"]), set(state.teams))
+
+    def test_bundle_carries_what_a_rebuild_needs(self):
+        """The page rebuilds the standings itself, so it needs the counting
+        teams per appearance and TBA's table to check the result against."""
+        from ranksim.export import bundle as build_bundle
+
+        state = load_state()
+        data = build_bundle(state)
+        for row, result in zip(data["results"], state.results):
+            self.assertEqual(row["countingTeams"], result.counting_teams)
+        surrogate_rows = [
+            r for r in data["results"] if len(r["countingTeams"]) < len(r["teams"])
+        ]
+        self.assertTrue(surrogate_rows, "event should have surrogates to test")
+        self.assertEqual(data["tbaRankings"]["order"], rank_teams(state.records))
+
+
+class StandingsSource(unittest.TestCase):
+    """The two starting points a projection can be run from."""
+
+    def setUp(self):
+        self.state = load_state()
+        self.fit = load_fit(self.state)
+
+    def test_csv_and_tba_bases_are_both_usable(self):
+        for source in ("csv", "tba"):
+            with self.subTest(source=source):
+                result = simulate(
+                    self.state, self.fit, SimOptions(n=200, seed=4, source=source)
+                )
+                self.assertEqual(result["meta"]["source"], source)
+                self.assertEqual(len(result["teams"]), len(self.state.teams))
+
+    def test_tba_base_ignores_the_csv(self):
+        """A stale CSV must not leak into the rebuilt-from-matches projection."""
+        stale = {t: r.copy() for t, r in self.state.csv_records.items()}
+        for record in stale.values():
+            record.rp += 50
+        self.state.csv_records = stale
+
+        from_csv = simulate(self.state, self.fit, SimOptions(n=200, seed=4, source="csv"))
+        from_tba = simulate(self.state, self.fit, SimOptions(n=200, seed=4, source="tba"))
+        csv_rp = {r["team"]: r["current"]["rp"] for r in from_csv["teams"]}
+        tba_rp = {r["team"]: r["current"]["rp"] for r in from_tba["teams"]}
+        for team, record in self.state.records.items():
+            self.assertEqual(tba_rp[team], record.rp)
+            self.assertEqual(csv_rp[team], record.rp + 50)
 
 
 if __name__ == "__main__":

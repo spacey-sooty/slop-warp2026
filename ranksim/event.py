@@ -127,6 +127,7 @@ class AllianceResult:
     """One played alliance-appearance, the unit the model is fitted on."""
 
     match_key: str
+    match_number: int
     color: str
     teams: list[str]
     counting_teams: list[str]
@@ -151,6 +152,34 @@ def team_num(team_key: str) -> str:
     return team_key[3:] if team_key.startswith("frc") else team_key
 
 
+def parse_rankings(payload: dict | None) -> dict | None:
+    """TBA's own published standings, reduced to what a cross-check needs.
+
+    The standings here are rebuilt from the score breakdowns rather than read
+    from this endpoint -- that is the only way to project them forward. But TBA
+    computes the same thing from the same matches, so its published table is a
+    free second opinion on the ranking rules, and worth carrying around to check
+    against rather than trusting the rebuild blindly.
+    """
+    rows = (payload or {}).get("rankings") or []
+    if not rows:
+        return None
+    ordered = sorted(rows, key=lambda r: r["rank"])
+    teams = {}
+    for row in rows:
+        record = row.get("record") or {}
+        extra = row.get("extra_stats") or []
+        teams[team_num(row["team_key"])] = {
+            "rank": row["rank"],
+            "played": row.get("matches_played", 0),
+            "rp": extra[0] if extra else None,
+            "wins": record.get("wins", 0),
+            "losses": record.get("losses", 0),
+            "ties": record.get("ties", 0),
+        }
+    return {"order": [team_num(r["team_key"]) for r in ordered], "teams": teams}
+
+
 @dataclass
 class EventState:
     event_key: str
@@ -159,6 +188,9 @@ class EventState:
     matches: list[Match]
     results: list[AllianceResult]
     records: dict[str, TeamRecord]
+    # TBA's published rankings, when the pull reached them: a reference to check
+    # the rebuilt standings against, never the source of them.
+    tba_rankings: dict | None = None
     csv_records: dict[str, TeamRecord] | None = None
     csv_aliases: dict[str, str] = field(default_factory=dict)
     csv_discrepancies: list[str] = field(default_factory=list)
@@ -184,6 +216,8 @@ def _alliance_result(match: dict, color: str) -> AllianceResult:
     sur = {team_num(t) for t in alliance["surrogate_team_keys"]}
     return AllianceResult(
         match_key=match["key"],
+        # Position in the schedule, which is what recency weighting decays over.
+        match_number=match["match_number"],
         color=color,
         teams=teams,
         counting_teams=[t for t in teams if t not in sur],
@@ -349,6 +383,42 @@ def _attach_csv(state: EventState, csv_path: Path) -> None:
     state.csv_records = canonical
     state.csv_aliases = aliases
     state.csv_discrepancies = discrepancies
+
+
+def published_mismatches(
+    records: dict[str, TeamRecord], published: dict | None
+) -> list[str] | None:
+    """Where the rebuilt standings disagree with TBA's published table.
+
+    None if there is nothing to compare against. The mirror of
+    verifyAgainstPublished in web/lib/standings.js, which does the same check in
+    the browser after rebuilding the standings there.
+    """
+    if not published or not published.get("order"):
+        return None
+    mismatches = []
+    order = rank_teams({t: records[t] for t in published["order"] if t in records})
+    for i, team in enumerate(published["order"]):
+        if i >= len(order) or order[i] != team:
+            got = order[i] if i < len(order) else "nothing"
+            mismatches.append(f"rank {i + 1}: TBA has {team}, rebuild has {got}")
+    for team, row in (published.get("teams") or {}).items():
+        record = records.get(team)
+        if record is None:
+            mismatches.append(f"{team}: ranked by TBA but not in the rebuild")
+            continue
+        for key, value in (
+            ("played", row.get("played")),
+            ("rp", row.get("rp")),
+            ("wins", row.get("wins")),
+            ("losses", row.get("losses")),
+            ("ties", row.get("ties")),
+        ):
+            if value is not None and getattr(record, key) != value:
+                mismatches.append(
+                    f"{team} {key}: TBA {value}, rebuild {getattr(record, key)}"
+                )
+    return mismatches
 
 
 def rank_teams(records: dict[str, TeamRecord]) -> list[str]:

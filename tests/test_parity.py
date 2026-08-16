@@ -30,7 +30,7 @@ from ranksim.loader import (  # noqa: E402
     load_fit,
     load_scouting,
 )
-from ranksim.event import rank_teams  # noqa: E402
+from ranksim.event import published_mismatches, rank_teams  # noqa: E402
 
 # Committed fixtures, so the suite is hermetic and CI needs no warm cache.
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -60,7 +60,7 @@ class Parity(unittest.TestCase):
         scouting_path = CACHE / "scouting.json"
         cls.bundle_path = bundle_path
 
-        def run_js(scouting_arg: str, weight: str = "1") -> dict:
+        def run_js(scouting_arg: str, weight: str = "1", half_life: str | None = None) -> dict:
             proc = subprocess.run(
                 [
                     "node",
@@ -68,6 +68,7 @@ class Parity(unittest.TestCase):
                     str(bundle_path),
                     scouting_arg,
                     weight,
+                    *([] if half_life is None else [half_life]),
                 ],
                 capture_output=True,
                 text=True,
@@ -79,6 +80,11 @@ class Parity(unittest.TestCase):
 
         cls.js_plain = run_js("-")
         cls.js_scouted = run_js(str(scouting_path)) if scouting_path.exists() else None
+        # The recency weights have to agree too: once with the decay off, and
+        # once at a half-life the bundle does not carry, so neither side can be
+        # passing by falling back to the same default.
+        cls.js_flat = run_js("-", "1", "0")
+        cls.js_short = run_js("-", "1", "7")
 
     @classmethod
     def tearDownClass(cls):
@@ -88,6 +94,12 @@ class Parity(unittest.TestCase):
 
     def assert_fit_matches(self, py_fit, js):
         summary = js["fit"]
+        for key in ("applied", "halfLife"):
+            self.assertEqual(py_fit.recency[key], summary["recency"][key])
+        for key in ("effectiveObservations", "oldestWeight", "newestWeight"):
+            self.assertAlmostEqual(
+                py_fit.recency[key], summary["recency"][key], delta=TOLERANCE
+            )
         self.assertAlmostEqual(py_fit.sigma_hub, summary["sigmaHub"], delta=TOLERANCE)
         self.assertAlmostEqual(py_fit.sigma_auto, summary["sigmaAuto"], delta=TOLERANCE)
         self.assertAlmostEqual(py_fit.r_squared, summary["rSquared"], delta=TOLERANCE)
@@ -113,8 +125,41 @@ class Parity(unittest.TestCase):
                     py_fit.expected_tower(team), got["expectedTower"], delta=TOLERANCE
                 )
 
+    def test_js_standings_unit_tests_pass(self):
+        """web/lib/standings.js against a hand-worked event (tests/js_standings.mjs)."""
+        proc = subprocess.run(
+            ["node", str(ROOT / "tests" / "js_standings.mjs")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
     def test_plain_fit_matches(self):
         self.assert_fit_matches(load_fit(self.state), self.js_plain)
+
+    def test_unweighted_fit_matches(self):
+        """Half-life 0: no decay, and both sides must land on the plain fit."""
+        self.assert_fit_matches(load_fit(self.state, half_life=0.0), self.js_flat)
+
+    def test_short_half_life_fit_matches(self):
+        self.assert_fit_matches(load_fit(self.state, half_life=7.0), self.js_short)
+
+    def test_recency_weighting_moves_the_fit(self):
+        """A guard against the weights being computed and then quietly ignored."""
+        flat = load_fit(self.state, half_life=0.0)
+        weighted = load_fit(self.state, half_life=7.0)
+        self.assertFalse(flat.recency["applied"])
+        self.assertTrue(weighted.recency["applied"])
+        self.assertLess(
+            weighted.recency["effectiveObservations"], flat.n_observations
+        )
+        self.assertTrue(
+            any(
+                abs(flat.hub[t] - weighted.hub[t]) > 1e-6 for t in self.state.teams
+            ),
+            "recency weighting left every hub rating unchanged",
+        )
 
     def test_scouted_fit_matches(self):
         if self.js_scouted is None:
@@ -166,6 +211,24 @@ class Parity(unittest.TestCase):
     def test_current_ranking_order_matches(self):
         base = self.state.csv_records or self.state.records
         self.assertEqual(rank_teams(base), self.js_plain["currentOrder"])
+
+    def test_rebuilt_standings_match_python(self):
+        """The page's rebuild from the match results == build_state's records."""
+        js = self.js_plain["rebuiltStandings"]
+        self.assertEqual(set(js), set(self.state.teams))
+        for team, record in self.state.records.items():
+            with self.subTest(team=team):
+                self.assertEqual(record.as_dict(), js[team])
+        self.assertEqual(rank_teams(self.state.records), self.js_plain["rebuiltOrder"])
+
+    def test_rebuilt_standings_match_tba(self):
+        """And both agree with the table TBA published for the same matches."""
+        self.assertEqual(
+            published_mismatches(self.state.records, self.state.tba_rankings), []
+        )
+        check = self.js_plain["rebuiltCheck"]
+        self.assertTrue(check["checked"], "fixture should carry TBA's rankings")
+        self.assertEqual(check["mismatches"], [])
 
     def test_sampler_agrees_statistically(self):
         """Different RNGs, so compare distributions rather than draws."""

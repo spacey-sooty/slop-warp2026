@@ -88,6 +88,11 @@ export function simulate(bundle, fit, options = {}) {
     cutoff = 8,
     forced = {},
     useScouting = true,
+    // Where the projection starts from. Defaults to the standings the bundle
+    // shipped with; the page passes its own rebuild from the match results
+    // when the standings source is switched.
+    standings = null,
+    standingsSource = null,
   } = options;
 
   const constants = bundle.constants;
@@ -99,7 +104,7 @@ export function simulate(bundle, fit, options = {}) {
   const random = mulberry32(seed === null ? (Math.random() * 4294967296) >>> 0 : seed);
   const gauss = gaussianFactory(random);
 
-  const base = bundle.standings;
+  const base = standings || bundle.standings;
   const baseRp = teams.map((t) => base[t].rp);
   const baseMp = teams.map((t) => base[t].matchPoints);
   const baseAf = teams.map((t) => base[t].autoFuel);
@@ -399,6 +404,7 @@ export function simulate(bundle, fit, options = {}) {
       cutoff: clampedCutoff,
       oprUncertainty,
       useScouting,
+      standingsSource: standingsSource || bundle.standingsSource,
       forced,
       forcedNudged: forcedNudges,
       remainingMatches: bundle.remaining.length,

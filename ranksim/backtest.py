@@ -13,7 +13,7 @@ import math
 from dataclasses import dataclass
 
 from .event import build_state
-from .model import fit as fit_model
+from .model import DEFAULT_HALF_LIFE, fit as fit_model
 from .simulate import SimOptions, simulate
 
 
@@ -58,6 +58,7 @@ def run(
     trials: int = 800,
     scouting=None,
     scouting_weight: float = 1.0,
+    half_life: float = DEFAULT_HALF_LIFE,
 ) -> dict:
     played = sorted(state.played, key=lambda m: m.number)
     by_number = {m.number: m for m in state.matches}
@@ -74,7 +75,11 @@ def run(
         # full dump to an earlier cut point is not hindsight -- unlike the match
         # results, which are truncated.
         sub_fit = fit_model(
-            sub, ridge=ridge, scouting=scouting, scouting_weight=scouting_weight
+            sub,
+            ridge=ridge,
+            scouting=scouting,
+            scouting_weight=scouting_weight,
+            half_life=half_life,
         )
         result = simulate(
             sub,

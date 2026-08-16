@@ -5,6 +5,9 @@ Everything the simulator needs is estimated here:
   hub / auto OPR   ridge-regularised least squares on alliance hub points and hub
                    auto points. Ridge shrinks toward the event mean, which matters
                    at 27 teams / 70 alliance-appearances where plain OPR is noisy.
+  recency weights  every observation is discounted by how long ago it happened, so
+                   a robot that fixed its intake after qm10 is rated on the matches
+                   since rather than on its whole event.
   residual sigma   spread of a single alliance's score around its predicted value.
   parameter SE     how well each team's rating is pinned down; optionally resampled
                    per simulation so a team with two matches is not treated as a
@@ -14,6 +17,12 @@ Everything the simulator needs is estimated here:
   foul model       empirical draw of opponent-foul points, which swing who wins a
                    match but never the ranking tiebreakers.
   RP thresholds    learned from this event's own achieved/not-achieved boundary.
+
+Recency weighting applies to everything that estimates *a team*: the two OPR
+fits, their residual sigma and standard errors, the climb distribution and the
+scouted climb calibration. It deliberately does not touch the RP thresholds or
+the foul draw -- a threshold is a fixed rule of the game being read off the
+data, not a quantity that drifts, and fouls are a property of the opponent.
 """
 
 from __future__ import annotations
@@ -51,12 +60,61 @@ DEFAULT_CLIMB_TRUST = 0.5
 # simulation treats their climbing as impossible rather than unlikely.
 MIN_CLIMB_PRIOR = 0.02
 
+# Recency: how many qualification matches it takes for an observation to count
+# half as much as one played now. Robots at an event are not a fixed quantity --
+# they break, get repaired, and their drivers get better -- so the last few
+# matches say more about the rest of the event than the first few do.
+#
+# Picked by walk-forward backtest, and deliberately not by how much it helps
+# here alone. 2026auwarp's own 20 out-of-sample matches prefer a much shorter
+# memory (half-life 6-12), but replaying the same test over the three reference
+# regionals shows that setting is actively harmful on a 66-80 match schedule,
+# where each team's matches are spread thin enough that a short half-life throws
+# away most of their record. 20 is the longest setting that still improves
+# 2026auwarp (Brier 0.157 -> 0.150) while leaving the regionals where they were.
+# Longer schedules want a longer half-life; 0 turns the decay off entirely.
+DEFAULT_HALF_LIFE = 20.0
+
 
 @dataclass
 class TowerOutcome:
     auto_level: str
     endgame_level: str
     points: int
+
+
+def recency_weights(
+    results: list[AllianceResult], half_life: float = DEFAULT_HALF_LIFE
+) -> list[float]:
+    """Per-observation weight, halving every `half_life` matches into the past.
+
+    Age is counted in schedule position, so both alliances of the same match get
+    the same weight and a team's own match count never enters into it. The
+    weights are then rescaled to average 1, which is what keeps the rest of the
+    model on its usual scale: ridge strength, residual sigma and the standard
+    errors all read against the number of observations, and a decay that shrank
+    the total weight would quietly turn into extra shrinkage.
+
+    Only the *gap* between matches matters, not what the reference point is --
+    rescaling cancels any common factor -- so this is the same whether it is
+    called mid-event or at the end.
+    """
+    if not results or half_life is None or half_life <= 0:
+        return [1.0] * len(results)
+    latest = max(r.match_number for r in results)
+    raw = [0.5 ** ((latest - r.match_number) / half_life) for r in results]
+    total = sum(raw)
+    if total <= 0:
+        return [1.0] * len(results)
+    scale = len(raw) / total
+    return [w * scale for w in raw]
+
+
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    total = sum(weights)
+    if total <= 0:
+        return statistics.fmean(values) if values else 0.0
+    return sum(w * v for w, v in zip(weights, values)) / total
 
 
 @dataclass
@@ -77,6 +135,7 @@ class Fit:
     mean_hub: float
     r_squared: float
     scouting: dict = field(default_factory=lambda: {"used": False})
+    recency: dict = field(default_factory=lambda: {"applied": False, "halfLife": 0.0})
 
     def summary(self) -> dict:
         return {
@@ -87,6 +146,7 @@ class Fit:
             "meanAllianceHub": self.mean_hub,
             "rSquared": self.r_squared,
             "scouting": self.scouting,
+            "recency": self.recency,
             "thresholds": self.thresholds,
             "thresholdSources": self.threshold_sources,
             "teams": {
@@ -115,21 +175,28 @@ def _fit_component(
     values: list[float],
     ridge: float,
     prior: dict[str, float] | None = None,
+    weights: list[float] | None = None,
 ) -> tuple[dict[str, float], dict[str, float], float, float]:
-    """Ridge least squares on alliance totals.
+    """Weighted ridge least squares on alliance totals.
 
-    Minimises ||Xb - y||^2 + ridge*||b - p||^2, where p is the shrinkage target:
-    the flat event mean by default, or a per-team prior (from scouting) when one
-    is supplied. Shrinking toward "what scouts expect of this team" rather than
-    "what the average team does" is what makes a two-match team's rating sane.
+    Minimises sum_i w_i (x_i b - y_i)^2 + ridge*||b - p||^2, where p is the
+    shrinkage target -- the flat event mean by default, or a per-team prior (from
+    scouting) when one is supplied -- and w is the recency weight. Shrinking
+    toward "what scouts expect of this team" rather than "what the average team
+    does" is what makes a two-match team's rating sane; weighting by w is what
+    makes a team's rating follow the robot it is running now.
+
+    The weights average 1, so with the decay off every w_i is exactly 1 and this
+    is the plain unweighted fit, residual sigma and standard errors included.
     """
     rows = [[index[t] for t in r.teams] for r in results]
-    mean_alliance = statistics.fmean(values)
+    w = [1.0] * len(values) if weights is None else weights
+    mean_alliance = _weighted_mean(values, w)
     per_team_mean = mean_alliance / 3.0
     targets = {t: (prior.get(t, per_team_mean) if prior else per_team_mean) for t in teams}
     centered = [v - sum(targets[t] for t in r.teams) for v, r in zip(values, results)]
 
-    ata, aty = normal_equations(rows, centered, len(teams), ridge)
+    ata, aty = normal_equations(rows, centered, len(teams), ridge, w)
     lower = cholesky(ata)
     deviations = chol_solve(lower, aty)
     ratings = {t: targets[t] + deviations[index[t]] for t in teams}
@@ -138,10 +205,10 @@ def _fit_component(
         v - sum(ratings[t] for t in r.teams) for v, r in zip(values, results)
     ]
     dof = max(len(values) - len(teams), 1)
-    sigma = math.sqrt(sum(e * e for e in residuals) / dof)
+    sigma = math.sqrt(sum(wi * e * e for wi, e in zip(w, residuals)) / dof)
 
-    total_ss = sum((v - mean_alliance) ** 2 for v in values)
-    resid_ss = sum(e * e for e in residuals)
+    total_ss = sum(wi * (v - mean_alliance) ** 2 for wi, v in zip(w, values))
+    resid_ss = sum(wi * e * e for wi, e in zip(w, residuals))
     r_squared = 1.0 - resid_ss / total_ss if total_ss > 0 else 0.0
 
     inv_diag = chol_inv_diag(lower)
@@ -177,6 +244,7 @@ def _tower_model(
     results: list[AllianceResult],
     teams: list[str],
     climb_prior: dict[str, float] | None = None,
+    weights: list[float] | None = None,
 ) -> dict[str, list[tuple[TowerOutcome, float]]]:
     """Per-robot distribution over climb outcomes.
 
@@ -187,10 +255,16 @@ def _tower_model(
     the prior becomes the team's own scouted climb capability, so a robot nobody
     has seen climb but everyone reports *can* climb is modelled as a climber, and
     a robot with no hanger drops to ~zero instead of the pooled average.
+
+    Observations carry their recency weight, which matters more here than
+    anywhere else in the fit: a hanger bolted on at lunchtime shows up as climbs
+    that all sit at the recent end, and an unweighted count buries them under a
+    morning's worth of no-climbs.
     """
-    per_team: dict[str, list[TowerOutcome]] = {t: [] for t in teams}
-    pooled: list[TowerOutcome] = []
-    for res in results:
+    w = [1.0] * len(results) if weights is None else weights
+    per_team: dict[str, list[tuple[TowerOutcome, float]]] = {t: [] for t in teams}
+    pooled: list[tuple[TowerOutcome, float]] = []
+    for res, weight in zip(results, w):
         for slot, team in enumerate(res.teams):
             auto_level = res.auto_tower_levels[slot]
             end_level = res.endgame_tower_levels[slot]
@@ -199,22 +273,30 @@ def _tower_model(
                 end_level,
                 AUTO_TOWER_VALUE.get(auto_level, 0) + ENDGAME_TOWER_VALUE.get(end_level, 0),
             )
-            per_team.setdefault(team, []).append(outcome)
-            pooled.append(outcome)
+            per_team.setdefault(team, []).append((outcome, weight))
+            pooled.append((outcome, weight))
 
     no_climb = TowerOutcome("None", "None", 0)
-    climbs = [o for o in pooled if o.points > 0]
+    climbs = [(o, weight) for o, weight in pooled if o.points > 0]
     # If nobody at the event has climbed yet, a scouted climber is assumed to
     # manage the cheapest climb the game offers.
-    climb_shapes = climbs or [TowerOutcome("None", "Level1", ENDGAME_TOWER_VALUE["Level1"])]
+    climb_shapes = climbs or [
+        (TowerOutcome("None", "Level1", ENDGAME_TOWER_VALUE["Level1"]), 1.0)
+    ]
+
+    def spread(pool: list[tuple[TowerOutcome, float]], mass: float):
+        """Split `mass` over a pool of outcomes in proportion to their weights."""
+        total = sum(weight for _, weight in pool)
+        if total <= 0:
+            return []
+        return [(o, mass * weight / total) for o, weight in pool]
 
     def distribution(
-        observations: list[TowerOutcome], prior: list[tuple[TowerOutcome, float]]
+        observations: list[tuple[TowerOutcome, float]],
+        prior: list[tuple[TowerOutcome, float]],
     ):
         counts: dict[tuple[str, str], list] = {}
-        for o in observations:
-            counts.setdefault((o.auto_level, o.endgame_level), [o, 0.0])[1] += 1.0
-        for o, weight in prior:
+        for o, weight in list(observations) + list(prior):
             counts.setdefault((o.auto_level, o.endgame_level), [o, 0.0])[1] += weight
         total = sum(c for _, c in counts.values()) or 1.0
         return [(o, c / total) for o, c in counts.values()]
@@ -222,14 +304,10 @@ def _tower_model(
     def prior_for(team: str) -> list[tuple[TowerOutcome, float]]:
         if climb_prior is not None and team in climb_prior:
             p = max(0.0, min(1.0, climb_prior[team]))
-            share = TOWER_PRIOR_WEIGHT * p / len(climb_shapes)
-            return [(o, share) for o in climb_shapes] + [
+            return spread(climb_shapes, TOWER_PRIOR_WEIGHT * p) + [
                 (no_climb, TOWER_PRIOR_WEIGHT * (1.0 - p))
             ]
-        if not pooled:
-            return []
-        share = TOWER_PRIOR_WEIGHT / len(pooled)
-        return [(o, share) for o in pooled]
+        return spread(pooled, TOWER_PRIOR_WEIGHT)
 
     return {t: distribution(per_team.get(t, []), prior_for(t)) for t in teams}
 
@@ -295,7 +373,10 @@ def _scouted_prior(
 
 
 def _climb_prior(
-    results: list[AllianceResult], scouted: dict, weight: float
+    results: list[AllianceResult],
+    scouted: dict,
+    weight: float,
+    weights: list[float] | None = None,
 ) -> tuple[dict[str, float] | None, dict]:
     """Scouted climb capability -> a per-match climb probability.
 
@@ -305,15 +386,20 @@ def _climb_prior(
     nothing to calibrate against, so scouted capability is discounted by a flat
     factor rather than taken at face value.
     """
-    observed: dict[str, list[bool]] = {}
-    for res in results:
+    w = [1.0] * len(results) if weights is None else weights
+    observed: dict[str, list[tuple[bool, float]]] = {}
+    for res, row_weight in zip(results, w):
         for slot, team in enumerate(res.teams):
             climbed = (
                 res.auto_tower_levels[slot] != "None"
                 or res.endgame_tower_levels[slot] != "None"
             )
-            observed.setdefault(team, []).append(climbed)
-    rates = {t: sum(v) / len(v) for t, v in observed.items() if v}
+            observed.setdefault(team, []).append((climbed, row_weight))
+    rates = {
+        t: sum(rw for c, rw in v if c) / sum(rw for _, rw in v)
+        for t, v in observed.items()
+        if v and sum(rw for _, rw in v) > 0
+    }
     scouted_rates = {t: s.can_climb_rate for t, s in scouted.items()}
 
     info: dict = {"metric": "canClimb report rate", "teamsUsed": len(scouted_rates)}
@@ -340,6 +426,7 @@ def fit(
     ridge: float = 3.0,
     scouting=None,
     scouting_weight: float = 1.0,
+    half_life: float = DEFAULT_HALF_LIFE,
 ) -> Fit:
     results = state.results
     teams = list(state.teams)
@@ -347,14 +434,15 @@ def fit(
     if not results:
         raise ValueError("no played qual matches to fit on")
 
+    weights = recency_weights(results, half_life)
     hub_values = [float(r.hub_points) for r in results]
     auto_values = [float(r.hub_auto) for r in results]
 
     hub, hub_se, sigma_hub, r_squared = _fit_component(
-        results, teams, index, hub_values, ridge
+        results, teams, index, hub_values, ridge, weights=weights
     )
     auto, auto_se, sigma_auto, _ = _fit_component(
-        results, teams, index, auto_values, ridge
+        results, teams, index, auto_values, ridge, weights=weights
     )
 
     scouting_info: dict = {"used": False}
@@ -377,13 +465,15 @@ def fit(
         )
         if hub_prior:
             hub, hub_se, sigma_hub, r_squared = _fit_component(
-                results, teams, index, hub_values, ridge, prior=hub_prior
+                results, teams, index, hub_values, ridge, prior=hub_prior, weights=weights
             )
         if auto_prior:
             auto, auto_se, sigma_auto, _ = _fit_component(
-                results, teams, index, auto_values, ridge, prior=auto_prior
+                results, teams, index, auto_values, ridge, prior=auto_prior, weights=weights
             )
-        climb_prior, climb_info = _climb_prior(results, scouted, scouting_weight)
+        climb_prior, climb_info = _climb_prior(
+            results, scouted, scouting_weight, weights=weights
+        )
         scouting_info = {
             "used": True,
             "reports": scouting.total_reports,
@@ -405,6 +495,19 @@ def fit(
         missed = [value(r) for r in results if not getattr(r, flag)]
         thresholds[name], sources[name] = _learn_threshold(achieved, missed, name)
 
+    # Effective sample size: how many equally-weighted matches the discounted
+    # ones are worth. The honest headline for "fitted on N appearances" once the
+    # oldest of them count for a fraction of a match.
+    sum_w = sum(weights)
+    sum_w2 = sum(w * w for w in weights)
+    recency = {
+        "applied": bool(half_life and half_life > 0),
+        "halfLife": float(half_life or 0.0),
+        "effectiveObservations": (sum_w * sum_w / sum_w2) if sum_w2 > 0 else 0.0,
+        "oldestWeight": min(weights),
+        "newestWeight": max(weights),
+    }
+
     return Fit(
         teams=teams,
         hub=hub,
@@ -413,13 +516,14 @@ def fit(
         auto_se=auto_se,
         sigma_hub=sigma_hub,
         sigma_auto=sigma_auto,
-        tower_outcomes=_tower_model(results, teams, climb_prior),
+        tower_outcomes=_tower_model(results, teams, climb_prior, weights),
         foul_samples=[r.foul_points for r in results],
         thresholds=thresholds,
         threshold_sources=sources,
         ridge=ridge,
         n_observations=len(results),
-        mean_hub=statistics.fmean(r.hub_points for r in results),
+        mean_hub=_weighted_mean([float(r.hub_points) for r in results], weights),
         r_squared=r_squared,
         scouting=scouting_info,
+        recency=recency,
     )

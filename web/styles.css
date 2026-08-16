@@ -101,6 +101,15 @@ header.top {
   margin-bottom: 20px;
 }
 
+/* Four buttons and their status pills: wraps rather than pushing the header
+   off a phone screen. */
+.top-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 h1 {
   font-size: 22px;
   font-weight: 600;

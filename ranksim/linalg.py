@@ -51,20 +51,27 @@ def chol_inv_diag(lower: list[list[float]]) -> list[float]:
 
 
 def normal_equations(
-    rows: list[list[int]], y: list[float], n_cols: int, ridge: float
+    rows: list[list[int]],
+    y: list[float],
+    n_cols: int,
+    ridge: float,
+    weights: list[float] | None = None,
 ) -> tuple[list[list[float]], list[float]]:
-    """Build (X'X + ridge*I, X'y) from sparse rows of column indices.
+    """Build (X'WX + ridge*I, X'Wy) from sparse rows of column indices.
 
     Every design row here is an alliance: three 1s and the rest zeros, so the
-    matrix is assembled from index pairs instead of a dense multiply.
+    matrix is assembled from index pairs instead of a dense multiply. W is the
+    diagonal of per-row weights (recency, here); without it every row counts
+    once, which is the unweighted case exactly.
     """
     ata = [[0.0] * n_cols for _ in range(n_cols)]
     aty = [0.0] * n_cols
-    for cols, target in zip(rows, y):
+    for k, (cols, target) in enumerate(zip(rows, y)):
+        w = 1.0 if weights is None else weights[k]
         for i in cols:
-            aty[i] += target
+            aty[i] += w * target
             for j in cols:
-                ata[i][j] += 1.0
+                ata[i][j] += w
     for i in range(n_cols):
         ata[i][i] += ridge
     return ata, aty

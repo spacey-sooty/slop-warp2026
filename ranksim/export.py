@@ -29,6 +29,7 @@ from .event import (
 )
 from .model import (
     DEFAULT_CLIMB_TRUST,
+    DEFAULT_HALF_LIFE,
     DEFAULT_THRESHOLDS,
     MIN_CLIMB_PRIOR,
     TOWER_PRIOR_WEIGHT,
@@ -42,6 +43,7 @@ def bundle(
     ridge: float = 3.0,
     scouting_url: str = SCOUTING_URL,
     generated_at: float = 0.0,
+    half_life: float = DEFAULT_HALF_LIFE,
 ) -> dict:
     base = state.csv_records if state.csv_records else state.records
     order = rank_teams(base)
@@ -61,6 +63,9 @@ def bundle(
         "standingsSource": "csv" if state.csv_records else "tba",
         "standings": {t: base[t].as_dict() for t in state.teams},
         "currentOrder": order,
+        # TBA's own published table. The page rebuilds the standings from the
+        # match breakdowns itself; this is what it checks that rebuild against.
+        "tbaRankings": state.tba_rankings,
         "csvAliases": state.csv_aliases,
         "csvDiscrepancies": state.csv_discrepancies,
         # One row per played alliance-appearance: the design matrix, the fit
@@ -68,8 +73,13 @@ def bundle(
         "results": [
             {
                 "matchKey": r.match_key,
+                # Schedule position, so the browser can rebuild the recency weights.
+                "matchNumber": r.match_number,
                 "color": r.color,
                 "teams": r.teams,
+                # Surrogate appearances score for the alliance but not for the
+                # surrogate, so the standings rebuild counts these three only.
+                "countingTeams": r.counting_teams,
                 "hubPoints": r.hub_points,
                 "hubAuto": r.hub_auto,
                 "towerPoints": r.tower_points,
@@ -105,6 +115,7 @@ def bundle(
             "winRp": WIN_RP,
             "tieRp": TIE_RP,
             "ridge": ridge,
+            "recencyHalfLife": half_life,
             "autoTowerValue": AUTO_TOWER_VALUE,
             "endgameTowerValue": ENDGAME_TOWER_VALUE,
             "defaultThresholds": DEFAULT_THRESHOLDS,

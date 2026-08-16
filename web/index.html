@@ -14,11 +14,13 @@
       <h1 id="event-name">Loading…</h1>
       <p class="subtitle" id="event-sub"></p>
     </div>
-    <div style="display:flex; gap:8px;">
+    <div class="top-actions">
       <button class="ghost-btn" id="tba-btn">Refresh TBA</button>
       <span class="pill hidden" id="tba-status"></span>
       <button class="ghost-btn" id="refresh-btn" title="Re-pull pit scouting from the live scoutinapp deployment and refit">Refresh scouting</button>
       <span class="pill hidden" id="scouting-status"></span>
+      <button class="ghost-btn" id="standings-btn">Use TBA standings</button>
+      <span class="pill hidden" id="standings-status"></span>
       <button class="ghost-btn" id="theme-btn" aria-label="Toggle colour theme">Theme</button>
     </div>
   </header>
@@ -43,6 +45,16 @@
     <div class="field">
       <label for="seed">Seed</label>
       <input type="number" id="seed" placeholder="random">
+    </div>
+    <div class="field">
+      <label for="half-life" title="A result this many matches old counts half as much as one played now. Shorter follows a robot that has changed; longer trusts the whole event equally.">Recency half-life</label>
+      <select id="half-life">
+        <option value="0">Off — all matches equal</option>
+        <option value="8">8 matches</option>
+        <option value="12">12 matches</option>
+        <option value="20">20 matches</option>
+        <option value="40">40 matches</option>
+      </select>
     </div>
     <label class="checkfield">
       <input type="checkbox" id="uncertainty" checked>
@@ -108,6 +120,7 @@
             <th>Hub OPR</th>
             <th>± SE</th>
             <th title="Change in hub OPR from folding in the scouting priors">Δ scouting</th>
+            <th title="Change in hub OPR from weighting recent matches more heavily than early ones">Δ recency</th>
             <th title="Median balls per match across this team's pit reports">Scouted balls</th>
             <th>Auto fuel OPR</th>
             <th>Climb rate</th>

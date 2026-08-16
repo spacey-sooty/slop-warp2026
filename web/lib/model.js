@@ -6,13 +6,38 @@
 // the fit at build time would freeze the priors and make the button cosmetic.
 //
 // tests/test_parity.py runs both implementations on the same bundle and asserts
-// every rating, sigma, threshold and climb probability agrees to 1e-9.
+// every rating, sigma, threshold and climb probability agrees to 1e-9 -- with
+// the recency weights on and off, and at a half-life the bundle does not carry.
 
 import { cholInvDiag, cholSolve, cholesky, mean, normalEquations } from "./linalg.js";
 
-function fitComponent(results, teams, index, values, ridge, prior) {
+// Per-observation weight, halving every `halfLife` matches into the past, then
+// rescaled to average 1 so ridge, sigma and the standard errors stay on the
+// scale they would have without any decay. halfLife <= 0 turns it off.
+export function recencyWeights(results, halfLife) {
+  if (!results.length || !halfLife || halfLife <= 0) return results.map(() => 1);
+  let latest = -Infinity;
+  for (const r of results) if (r.matchNumber > latest) latest = r.matchNumber;
+  const raw = results.map((r) => Math.pow(0.5, (latest - r.matchNumber) / halfLife));
+  const total = raw.reduce((a, w) => a + w, 0);
+  if (total <= 0) return results.map(() => 1);
+  const scale = raw.length / total;
+  return raw.map((w) => w * scale);
+}
+
+function weightedMean(values, weights) {
+  let total = 0;
+  for (const w of weights) total += w;
+  if (total <= 0) return mean(values);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) sum += weights[i] * values[i];
+  return sum / total;
+}
+
+function fitComponent(results, teams, index, values, ridge, prior, weights) {
   const rows = results.map((r) => r.teams.map((t) => index[t]));
-  const meanAlliance = mean(values);
+  const w = weights || values.map(() => 1);
+  const meanAlliance = weightedMean(values, w);
   const perTeamMean = meanAlliance / 3;
 
   const targets = {};
@@ -23,7 +48,7 @@ function fitComponent(results, teams, index, values, ridge, prior) {
     (v, i) => v - results[i].teams.reduce((acc, t) => acc + targets[t], 0)
   );
 
-  const { ata, aty } = normalEquations(rows, centered, teams.length, ridge);
+  const { ata, aty } = normalEquations(rows, centered, teams.length, ridge, w);
   const lower = cholesky(ata);
   const deviations = cholSolve(lower, aty);
 
@@ -34,10 +59,10 @@ function fitComponent(results, teams, index, values, ridge, prior) {
     (v, i) => v - results[i].teams.reduce((acc, t) => acc + ratings[t], 0)
   );
   const dof = Math.max(values.length - teams.length, 1);
-  const sigma = Math.sqrt(residuals.reduce((a, e) => a + e * e, 0) / dof);
+  const sigma = Math.sqrt(residuals.reduce((a, e, i) => a + w[i] * e * e, 0) / dof);
 
-  const totalSs = values.reduce((a, v) => a + (v - meanAlliance) ** 2, 0);
-  const residSs = residuals.reduce((a, e) => a + e * e, 0);
+  const totalSs = values.reduce((a, v, i) => a + w[i] * (v - meanAlliance) ** 2, 0);
+  const residSs = residuals.reduce((a, e, i) => a + w[i] * e * e, 0);
   const rSquared = totalSs > 0 ? 1 - residSs / totalSs : 0;
 
   const invDiag = cholInvDiag(lower);
@@ -70,13 +95,14 @@ export function calibrate(x, y) {
   return { intercept, slope, rSquared: Math.max(0, Math.min(1, rSquared)) };
 }
 
-function towerModel(results, teams, climbPrior, constants) {
+function towerModel(results, teams, climbPrior, constants, weights) {
   const { autoTowerValue, endgameTowerValue, towerPriorWeight } = constants;
+  const w = weights || results.map(() => 1);
   const perTeam = {};
   for (const t of teams) perTeam[t] = [];
   const pooled = [];
 
-  for (const res of results) {
+  results.forEach((res, i) => {
     res.teams.forEach((team, slot) => {
       const autoLevel = res.autoTowerLevels[slot];
       const endLevel = res.endgameTowerLevels[slot];
@@ -85,42 +111,46 @@ function towerModel(results, teams, climbPrior, constants) {
         endLevel,
         points: (autoTowerValue[autoLevel] || 0) + (endgameTowerValue[endLevel] || 0),
       };
-      (perTeam[team] = perTeam[team] || []).push(outcome);
-      pooled.push(outcome);
+      (perTeam[team] = perTeam[team] || []).push([outcome, w[i]]);
+      pooled.push([outcome, w[i]]);
     });
-  }
+  });
 
   const noClimb = { autoLevel: "None", endLevel: "None", points: 0 };
-  const climbs = pooled.filter((o) => o.points > 0);
+  const climbs = pooled.filter(([o]) => o.points > 0);
   // If nobody has climbed yet, a scouted climber is assumed to manage the
   // cheapest climb the game offers.
   const climbShapes = climbs.length
     ? climbs
-    : [{ autoLevel: "None", endLevel: "Level1", points: endgameTowerValue.Level1 }];
+    : [[{ autoLevel: "None", endLevel: "Level1", points: endgameTowerValue.Level1 }, 1]];
+
+  // Split `mass` over a pool of outcomes in proportion to their weights.
+  const spread = (pool, mass) => {
+    const total = pool.reduce((a, [, weight]) => a + weight, 0);
+    if (total <= 0) return [];
+    return pool.map(([o, weight]) => [o, (mass * weight) / total]);
+  };
 
   const priorFor = (team) => {
     if (climbPrior && climbPrior[team] !== undefined) {
       const p = Math.max(0, Math.min(1, climbPrior[team]));
-      const share = (towerPriorWeight * p) / climbShapes.length;
-      return climbShapes
-        .map((o) => [o, share])
-        .concat([[noClimb, towerPriorWeight * (1 - p)]]);
+      return spread(climbShapes, towerPriorWeight * p).concat([
+        [noClimb, towerPriorWeight * (1 - p)],
+      ]);
     }
-    if (!pooled.length) return [];
-    const share = towerPriorWeight / pooled.length;
-    return pooled.map((o) => [o, share]);
+    return spread(pooled, towerPriorWeight);
   };
 
   const distribution = (observations, prior) => {
     const counts = new Map();
-    const bump = (o, w) => {
+    const bump = (o, weight) => {
       const key = `${o.autoLevel}|${o.endLevel}`;
       const row = counts.get(key) || [o, 0];
-      row[1] += w;
+      row[1] += weight;
       counts.set(key, row);
     };
-    for (const o of observations) bump(o, 1);
-    for (const [o, w] of prior) bump(o, w);
+    for (const [o, weight] of observations) bump(o, weight);
+    for (const [o, weight] of prior) bump(o, weight);
     let total = 0;
     for (const [, c] of counts.values()) total += c;
     if (total <= 0) total = 1;
@@ -186,18 +216,22 @@ function scoutedPrior(scouted, baseline, teams, weight, label) {
 // Scouted climb capability -> a per-match climb probability. Capability is not
 // frequency, so it is calibrated against observed climb rates once the event has
 // produced any, and flat-discounted until then.
-function climbPriorFrom(results, scoutedTeams, weight, constants) {
+function climbPriorFrom(results, scoutedTeams, weight, constants, weights) {
+  const w = weights || results.map(() => 1);
   const observed = {};
-  for (const res of results) {
+  results.forEach((res, i) => {
     res.teams.forEach((team, slot) => {
       const climbed =
         res.autoTowerLevels[slot] !== "None" || res.endgameTowerLevels[slot] !== "None";
-      (observed[team] = observed[team] || []).push(climbed);
+      (observed[team] = observed[team] || []).push([climbed, w[i]]);
     });
-  }
+  });
   const rates = {};
   for (const [team, seen] of Object.entries(observed)) {
-    if (seen.length) rates[team] = seen.filter(Boolean).length / seen.length;
+    const total = seen.reduce((a, [, rw]) => a + rw, 0);
+    if (seen.length && total > 0) {
+      rates[team] = seen.reduce((a, [c, rw]) => a + (c ? rw : 0), 0) / total;
+    }
   }
 
   const scoutedRates = {};
@@ -231,20 +265,25 @@ function climbPriorFrom(results, scoutedTeams, weight, constants) {
   return { prior, info };
 }
 
-export function fit(bundle, { scouting = null, scoutingWeight = 1, ridge = null } = {}) {
+export function fit(
+  bundle,
+  { scouting = null, scoutingWeight = 1, ridge = null, halfLife = null } = {}
+) {
   const constants = bundle.constants;
   const results = bundle.results;
   const teams = bundle.teams;
   const index = {};
   teams.forEach((t, i) => (index[t] = i));
   const lambda = ridge === null ? constants.ridge : ridge;
+  const decay = halfLife === null ? constants.recencyHalfLife || 0 : halfLife;
   if (!results.length) throw new Error("no played qual matches to fit on");
 
+  const weights = recencyWeights(results, decay);
   const hubValues = results.map((r) => r.hubPoints);
   const autoValues = results.map((r) => r.hubAuto);
 
-  let hubFit = fitComponent(results, teams, index, hubValues, lambda, null);
-  let autoFit = fitComponent(results, teams, index, autoValues, lambda, null);
+  let hubFit = fitComponent(results, teams, index, hubValues, lambda, null, weights);
+  let autoFit = fitComponent(results, teams, index, autoValues, lambda, null, weights);
 
   let scoutingInfo = { used: false };
   let climbPrior = null;
@@ -268,12 +307,16 @@ export function fit(bundle, { scouting = null, scoutingWeight = 1, ridge = null 
       autoBy, autoFit.ratings, teams, scoutingWeight, "median auto balls"
     );
     if (hubPrior.prior) {
-      hubFit = fitComponent(results, teams, index, hubValues, lambda, hubPrior.prior);
+      hubFit = fitComponent(
+        results, teams, index, hubValues, lambda, hubPrior.prior, weights
+      );
     }
     if (autoPrior.prior) {
-      autoFit = fitComponent(results, teams, index, autoValues, lambda, autoPrior.prior);
+      autoFit = fitComponent(
+        results, teams, index, autoValues, lambda, autoPrior.prior, weights
+      );
     }
-    const climb = climbPriorFrom(results, scoutedTeams, scoutingWeight, constants);
+    const climb = climbPriorFrom(results, scoutedTeams, scoutingWeight, constants, weights);
     climbPrior = climb.prior;
     scoutingInfo = {
       used: true,
@@ -301,11 +344,27 @@ export function fit(bundle, { scouting = null, scoutingWeight = 1, ridge = null 
     thresholdSources[name] = learned.source;
   }
 
-  const towerOutcomes = towerModel(results, teams, climbPrior, constants);
+  const towerOutcomes = towerModel(results, teams, climbPrior, constants, weights);
   const towerRate = (team) =>
     towerOutcomes[team].reduce((a, [o, p]) => a + (o.points > 0 ? p : 0), 0);
   const expectedTower = (team) =>
     towerOutcomes[team].reduce((a, [o, p]) => a + o.points * p, 0);
+
+  // Effective sample size: how many equally-weighted matches the discounted
+  // ones are worth, once the oldest count for a fraction of a match.
+  let sumW = 0;
+  let sumW2 = 0;
+  for (const wi of weights) {
+    sumW += wi;
+    sumW2 += wi * wi;
+  }
+  const recency = {
+    applied: decay > 0,
+    halfLife: decay,
+    effectiveObservations: sumW2 > 0 ? (sumW * sumW) / sumW2 : 0,
+    oldestWeight: Math.min(...weights),
+    newestWeight: Math.max(...weights),
+  };
 
   return {
     teams,
@@ -324,8 +383,9 @@ export function fit(bundle, { scouting = null, scoutingWeight = 1, ridge = null 
     thresholdSources,
     ridge: lambda,
     observations: results.length,
-    meanAllianceHub: mean(hubValues),
+    meanAllianceHub: weightedMean(hubValues, weights),
     scouting: scoutingInfo,
+    recency,
   };
 }
 
@@ -349,6 +409,7 @@ export function fitSummary(f) {
     meanAllianceHub: f.meanAllianceHub,
     rSquared: f.rSquared,
     scouting: f.scouting,
+    recency: f.recency,
     thresholds: f.thresholds,
     thresholdSources: f.thresholdSources,
     teams,

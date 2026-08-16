@@ -17,8 +17,9 @@ import json
 import sys
 from pathlib import Path
 
-from ranksim.event import rank_teams
+from ranksim.event import published_mismatches, rank_teams
 from ranksim.loader import DEFAULT_CSV, DEFAULT_EVENT, load_event, load_fit, load_scouting
+from ranksim.model import DEFAULT_HALF_LIFE
 from ranksim.scouting import DEFAULT_URL as SCOUTING_URL
 from ranksim.server import serve
 from ranksim.simulate import SimOptions, simulate
@@ -29,6 +30,11 @@ def common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV, help="standings CSV")
     parser.add_argument("--offline", action="store_true", help="use the cache only")
     parser.add_argument("--ridge", type=float, default=3.0, help="OPR ridge strength")
+    parser.add_argument(
+        "--half-life", type=float, default=DEFAULT_HALF_LIFE, metavar="MATCHES",
+        help="recency half-life: a result this many matches old counts half as "
+             "much as one played now (0 weights every match equally)",
+    )
     parser.add_argument("--no-scouting", action="store_true", help="ignore the scoutinapp data")
     parser.add_argument("--scouting-url", default=SCOUTING_URL, help="scoutinapp export endpoint")
     parser.add_argument(
@@ -56,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--seed", type=int, default=None)
     report.add_argument("--cutoff", type=int, default=8, help="alliance-captain cutoff")
     report.add_argument("--no-uncertainty", action="store_true", help="fix team ratings at their point estimates")
+    report.add_argument(
+        "--standings", choices=("csv", "tba"), default="csv",
+        help="start from the standings CSV (default, when there is one) or from "
+             "the ones rebuilt here from TBA's played matches",
+    )
     report.add_argument("--win", action="append", default=[], metavar="TEAM", help="force TEAM to win every remaining match (repeatable)")
     report.add_argument("--lose", action="append", default=[], metavar="TEAM", help="force TEAM to lose every remaining match (repeatable)")
     report.add_argument("--force", action="append", default=[], metavar="MATCH=COLOR", help="force a match, e.g. 2026auwarp_qm40=red")
@@ -112,6 +123,16 @@ def print_fit(state, fit) -> None:
         f"  fitted on {fit.n_observations} alliance-appearances, ridge {fit.ridge}, "
         f"R^2 {fit.r_squared:.3f}, residual sigma {fit.sigma_hub:.1f} hub pts"
     )
+    rec = fit.recency
+    if rec.get("applied"):
+        print(
+            f"  recency half-life {rec['halfLife']:g} matches -> "
+            f"{rec['effectiveObservations']:.1f} effective appearances, "
+            f"oldest weighted {rec['oldestWeight']:.2f} against the newest at "
+            f"{rec['newestWeight']:.2f}"
+        )
+    else:
+        print("  no recency weighting (every match counts the same)")
     info = fit.scouting
     if info.get("used"):
         print(
@@ -173,6 +194,28 @@ def print_scouting(state, scouting, fit) -> None:
         )
 
 
+def describe_standings(state, source: str) -> str:
+    """Which standings a projection started from, and whether they check out.
+
+    The CSV is a snapshot someone exported at some point; the rebuild is derived
+    from every match TBA has scored. When TBA has published its own table, the
+    rebuild is checked against it -- same matches, same rules, so a disagreement
+    means the ranking rules here are wrong and everything downstream with them.
+    """
+    if source == "csv" and state.csv_records:
+        stale = len(state.csv_discrepancies)
+        note = f", {stale} row(s) disagree with TBA" if stale else ""
+        return f"CSV snapshot{note}"
+    mismatches = published_mismatches(state.records, state.tba_rankings)
+    if mismatches is None:
+        check = "TBA has published no rankings to check against"
+    elif mismatches:
+        check = f"DISAGREES with TBA's published rankings: {'; '.join(mismatches[:3])}"
+    else:
+        check = "agrees with TBA's published rankings"
+    return f"rebuilt from TBA's {len(state.played)} played matches ({check})"
+
+
 def print_report(state, result, fit=None) -> None:
     meta = result["meta"]
     print(f"{state.event_name} ({state.event_key})")
@@ -180,6 +223,7 @@ def print_report(state, result, fit=None) -> None:
         f"  {len(state.played)} played / {meta['remainingMatches']} remaining, "
         f"{meta['n']} trials, top-{meta['cutoff']} cutoff"
     )
+    print(f"  standings: {describe_standings(state, meta['source'])}")
     if meta["forced"]:
         print(f"  scenario: {len(meta['forced'])} match(es) forced")
     if state.csv_discrepancies:
@@ -233,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
             ridge=args.ridge,
             scouting_url=args.scouting_url,
             generated_at=time.time(),
+            half_life=args.half_life,
         )
         print(f"{state.event_name} ({state.event_key})")
         print(
@@ -244,7 +289,8 @@ def main(argv: list[str] | None = None) -> int:
         from ranksim.server import RefreshService
 
         service = RefreshService(
-            args.event, args.csv, args.ridge, args.scouting_url, out
+            args.event, args.csv, args.ridge, args.scouting_url, out,
+            half_life=args.half_life,
         )
         serve(host=args.host, port=args.port, service=service)
         return 0
@@ -261,7 +307,11 @@ def main(argv: list[str] | None = None) -> int:
             refresh=args.command == "fetch",
         )
     fit = load_fit(
-        state, ridge=args.ridge, scouting=scouting, scouting_weight=args.scouting_weight
+        state,
+        ridge=args.ridge,
+        scouting=scouting,
+        scouting_weight=args.scouting_weight,
+        half_life=args.half_life,
     )
     if scouting_error:
         print(f"  scouting unavailable, using on-field data only: {scouting_error}")
@@ -287,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             trials=args.trials,
             scouting=scouting,
             scouting_weight=args.scouting_weight,
+            half_life=args.half_life,
         )
         print(f"{state.event_name} ({state.event_key})")
         print(
@@ -303,6 +354,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"  {b['range']:<12}{b['n']:>4}{100 * b['predicted']:>10.0f}%{100 * b['actual']:>8.0f}%"
                 )
+        def compare(question: str, rows: list[tuple[str, dict]]) -> None:
+            print()
+            print(f"  {question}")
+            print(f"  {'model':<22}{'called':>8}{'Brier':>9}{'log loss':>10}{'score MAE':>11}")
+            for label, res in rows:
+                print(
+                    f"  {label:<22}{100 * res['accuracy']:>7.0f}%{res['brier']:>9.3f}"
+                    f"{res['logLoss']:>10.3f}{res['scoreMae']:>11.1f}"
+                )
+
         if scouting is not None:
             # Same matches, same trials, same seeds -- the only difference is
             # whether the scouting priors were in the fit.
@@ -312,15 +373,31 @@ def main(argv: list[str] | None = None) -> int:
                 min_matches=args.min_matches,
                 trials=args.trials,
                 scouting=None,
+                half_life=args.half_life,
             )
-            print()
-            print("  does scouting help?")
-            print(f"  {'model':<22}{'called':>8}{'Brier':>9}{'log loss':>10}{'score MAE':>11}")
-            for label, res in (("on-field only", plain), ("+ pit scouting", out)):
-                print(
-                    f"  {label:<22}{100 * res['accuracy']:>7.0f}%{res['brier']:>9.3f}"
-                    f"{res['logLoss']:>10.3f}{res['scoreMae']:>11.1f}"
-                )
+            compare(
+                "does scouting help?",
+                [("on-field only", plain), ("+ pit scouting", out)],
+            )
+
+        if args.half_life > 0:
+            # Same again for the decay: everything else held, weights off.
+            flat = backtest.run(
+                state,
+                ridge=args.ridge,
+                min_matches=args.min_matches,
+                trials=args.trials,
+                scouting=scouting,
+                scouting_weight=args.scouting_weight,
+                half_life=0.0,
+            )
+            compare(
+                "does recency weighting help?",
+                [
+                    ("every match equal", flat),
+                    (f"half-life {args.half_life:g}", out),
+                ],
+            )
         print()
         # Scores are ranking match points, which exclude points awarded from the
         # opponent's fouls -- so an alliance can win a match it trails on here.
@@ -344,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
             ridge=args.ridge,
             scouting_url=args.scouting_url,
             generated_at=time.time(),
+            half_life=args.half_life,
         )
         size = path.stat().st_size
         print(f"wrote {path} ({size / 1024:.0f} KB)")
@@ -372,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
         opr_uncertainty=not args.no_uncertainty,
         cutoff=args.cutoff,
         forced=resolve_forced(state, args),
+        source=args.standings,
     )
     result = simulate(state, fit, options)
     if args.json:

@@ -80,6 +80,17 @@ jobs:
           if source != "tba":
               print("::error::bundle was not built from a live TBA pull")
               sys.exit(1)
+          # The standings are rebuilt from the score breakdowns; TBA publishes
+          # its own table from the same matches. A mismatch means the ranking
+          # rules have drifted -- but the two endpoints are not updated
+          # atomically, so a run seconds after a match can disagree honestly.
+          # Warn rather than block the deploy.
+          published = (data.get("tbaRankings") or {}).get("order")
+          if published and data.get("standingsSource") == "tba":
+              if published != data["currentOrder"]:
+                  print("::warning::rebuilt standings order differs from TBA's published rankings")
+          elif not published:
+              print("::warning::TBA published no rankings to check the rebuild against")
           age = time.time() - data["generatedAt"]
           if age > 600:
               print(f"::error::bundle timestamp is {age:.0f}s old")

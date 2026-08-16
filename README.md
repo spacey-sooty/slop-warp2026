@@ -31,6 +31,7 @@ the browser.
 |---|---|---|
 | Played results, schedule, standings | baked into `data/event.json` (TBA needs a key, which must never ship to a browser) | **Refresh TBA** button |
 | Pit scouting | fetched at page load from the deployed app | **Refresh scouting** button |
+| Current standings | the exported snapshot, or [rebuilt in the page](#standings-the-csv-or-the-matches) from the played matches | **Use TBA standings** button |
 
 The split falls out of the key: TBA's API needs one, so its data is resolved
 somewhere trusted; scoutinapp's export needs none and serves
@@ -89,8 +90,11 @@ Relative URLs throughout, so serving from a subpath
 `ranksim/model.py` and `web/lib/model.js` are the same statistics twice, which is
 a genuine maintenance hazard. `tests/test_parity.py` is the guard: it runs both
 over the same bundle and asserts every rating, standard error, sigma, threshold,
-calibration coefficient and climb probability agrees to **1e-9**, plus the whole
-scouting reduction (medians, rates, tags, picklist consensus) exactly. Change one
+calibration coefficient, recency weight and climb probability agrees to
+**1e-9**, plus the whole scouting reduction (medians, rates, tags, picklist
+consensus) and the standings rebuilt in the browser (every field of every team's
+record, and the ranking order) exactly. The recency check runs at three half-lives, one of them not
+the bundle's, so neither side can pass by falling back to the same default. Change one
 without the other and the suite fails.
 
 The samplers use different RNGs, so a seed does not reproduce across them; that
@@ -136,10 +140,15 @@ re-simulate without a visible pause.
   buttons that force an outcome and re-run instantly. That is the what-if tool:
   force a team's matches and watch their playoff odds move.
 - **Model** — the fitted ratings and the RP thresholds the simulation is using.
+- **Use TBA standings** — recompute the current standings from the played
+  matches instead of the exported snapshot, and start the projection from those.
+  See [Standings: the CSV, or the matches](#standings-the-csv-or-the-matches).
 
 Controls at the top set trial count, the cutoff rank (default 8, the alliance
-captain line), a fixed seed for reproducibility, whether to include rating
-uncertainty, and whether to fold in pit scouting. `?theme=light` / `?theme=dark`
+captain line), a fixed seed for reproducibility, the [recency
+half-life](#recency), whether to include rating uncertainty, and whether to fold
+in pit scouting. Changing the half-life refits in the page and re-runs, so the
+effect of trusting recent matches more is visible immediately. `?theme=light` / `?theme=dark`
 pins the theme for a pit display; `?team=9991` deep-links to a team's panel.
 
 ## Ranking rules (2026)
@@ -165,6 +174,38 @@ the achieved / not-achieved boundary) rather than hardcoded, so this works at an
 offseason event running modified thresholds — as 2026auwarp does. Regional values
 are only a fallback for an achievement nobody has managed yet.
 
+### Standings: the CSV, or the matches
+
+A projection starts from the current standings, and there are two of them. The
+bundle ships a snapshot — for this event the hand-supplied `event-rankings.csv`,
+which was exported by a human at some point and is a fixed picture from then on.
+The alternative is to apply the rules above to every match TBA has scored and
+work the table out, which is what **Use TBA standings** does. That is not a
+second table read off an endpoint: `web/lib/standings.js` accumulates RP, match
+points, auto fuel, tower points and W-L-T per team from the score breakdowns,
+drops surrogate appearances from the surrogate's own record, and re-sorts by the
+official tiebreaker chain. `./sim.py report --standings tba` is the same thing on
+the CLI.
+
+The button says what it changed — how many teams' records differ and how many
+rank positions moved — because most of the time the answer is "nothing", and the
+one time it is not, that is exactly what you want to see before reading the
+projection.
+
+**TBA computes the same table from the same matches, so the rebuild is checked
+against it.** The published rankings ride along in the bundle as `tbaRankings`
+purely as a reference: the page compares its own rebuild — order, plus each
+team's played / RP / W-L-T — and reports `matches TBA` or, in red, what
+disagrees. A disagreement means the ranking rules here have drifted from the
+real ones, which would quietly poison every projection; `./sim.py report
+--standings tba` prints the same verdict, `tests/test_ranking.py` asserts it
+across the fixture event, and the deploy workflow warns on it. If TBA has
+published no rankings yet, the check simply says so.
+
+The reference is never an input. Standings have to be *rebuildable* to be
+projectable — the simulator adds hypothetical matches to them a few thousand
+times over — so reading a finished table would not do.
+
 ## The model
 
 Fitted on every played qualification match at the event:
@@ -173,10 +214,54 @@ Fitted on every played qualification match at the event:
 |---|---|
 | Hub OPR | ridge-regularised least squares on alliance hub points. Ridge shrinks toward the event mean, which matters at 27 teams / 70 alliance appearances |
 | Auto fuel OPR | the same fit against `hubScore.autoPoints` |
+| Recency | every observation is discounted by how long ago it happened, so a robot is rated on what it is doing now rather than on its whole event |
 | Residual σ | spread of a single alliance's score around its prediction |
 | Rating SE | how well each team's rating is pinned down; resampled per trial so a team with two matches is not treated as a known quantity |
 | Climbs | per-robot empirical distribution over climb outcomes, smoothed toward a prior (scouted capability when available, else the event-wide pool) |
 | Fouls | empirical draw of opponent-foul points |
+
+### Recency
+
+A robot mid-event is not a fixed quantity: intakes get fixed, hangers get
+bolted on, drivers get better, and something breaks. So every alliance
+appearance carries a weight that halves every **20 qualification matches** into
+the past, and the fit minimises `Σ wᵢ (predictedᵢ − actualᵢ)² + ridge‖b − prior‖²`
+instead of the flat sum. The weights are rescaled to average 1, which is what
+keeps everything downstream on its usual scale — ridge strength, residual σ and
+the standard errors all read against the number of observations, and a decay
+that shrank the total weight would quietly turn into extra shrinkage.
+
+Age is counted in **schedule position**, not in a team's own matches, so both
+alliances of a match weigh the same and a team that has played more does not
+decay faster. Only the gap between matches matters, so the weights are the same
+whether they are computed mid-event or at the end.
+
+It applies to everything that estimates *a team* — both OPR fits, their σ and
+standard errors, the climb distribution, and the calibration of scouted climb
+capability against observed climbs. It deliberately does **not** touch the RP
+thresholds (a fixed rule of the game being read off the data, not something
+that drifts) or the foul draw (a property of the opponent).
+
+The half-life is the whole design decision, and it was not chosen on this event
+alone. 2026auwarp's own backtest prefers a much shorter memory — half-life 6–12
+scores best over its 20 out-of-sample matches — but replaying the same
+walk-forward test over the reference regionals shows that setting is actively
+harmful on a 66–80 match schedule, where each team's matches are spread thin
+enough that a short half-life throws most of their record away:
+
+```
+                    2026auwarp        2026cosp        2026tuis        2026mndu
+half-life        Brier    MAE      Brier    MAE     Brier    MAE     Brier    MAE
+off (0)          0.157   28.7      0.112   60.0     0.169   45.1     0.178   35.9
+6                0.139   27.5      0.145   65.5        —      —         —      —
+20               0.150   28.1      0.114   61.6     0.167   45.7     0.181   35.6
+```
+
+20 is the longest half-life that still improves this event while leaving the
+regionals where they were. A longer schedule wants a longer half-life:
+`--half-life N` sets it, `--half-life 0` turns the decay off, and **Recency
+half-life** in the UI does the same live. `./sim.py backtest` reports what it is
+worth on whatever event you point it at, the same way it does for scouting.
 
 Each trial draws a rating vector, then for every remaining match draws both
 alliances' hub score (normal, truncated at zero, rounded — real scores are
@@ -192,8 +277,8 @@ default model (scouting on):
 
 ```
 winner called       80%
-Brier score         0.157   (0.25 = coin flip, lower is better)
-mean score error    28.7 points per alliance
+Brier score         0.150   (0.25 = coin flip, lower is better)
+mean score error    28.1 points per alliance
 ```
 
 Calibration runs slightly *under*-confident — matches called at 60–70% all
@@ -252,13 +337,22 @@ trials, same seeds:
 
 ```
 model                   called    Brier  log loss  score MAE
-on-field only              80%    0.176     0.538       31.1
-+ pit scouting             80%    0.157     0.491       28.7
+on-field only              80%    0.180     0.544       30.5
++ pit scouting             80%    0.150     0.476       28.1
 ```
 
 Better probabilities and better score estimates out of sample. Turn it off with
 `--no-scouting`, or the **Use pit scouting** checkbox in the UI; `Δ scouting` in
 the model table shows what it moved for each team.
+
+The same command runs the same test for the recency decay, everything else held
+(`Δ recency` in the model table is its per-team counterpart):
+
+```
+model                   called    Brier  log loss  score MAE
+every match equal          80%    0.157     0.491       28.7
+half-life 20               80%    0.150     0.476       28.1
+```
 
 ### Team ids
 
@@ -270,7 +364,8 @@ and are ignored with a note in the UI.
 
 ## Data
 
-- `../event-rankings.csv` — current standings, used as the starting point.
+- `../event-rankings.csv` — current standings, used as the starting point unless
+  the [standings are rebuilt](#standings-the-csv-or-the-matches) from the matches.
 - `cache/<event>/` — the TBA pull. Everything works offline from this cache;
   `--offline` never touches the network.
 - `cache/<event>/scouting.json` — the scoutinapp dump, cached the same way.

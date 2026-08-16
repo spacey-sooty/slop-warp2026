@@ -5,6 +5,11 @@
 import { fit as fitModel, fitSummary } from "./lib/model.js";
 import { build as buildScouting, fetchScouting } from "./lib/scouting.js";
 import { simulate } from "./lib/simulate.js";
+import {
+  buildStandings,
+  diffStandings,
+  verifyAgainstPublished,
+} from "./lib/standings.js";
 
 const $ = (id) => document.getElementById(id);
 const pct = (p, digits = 1) => `${(100 * p).toFixed(digits)}%`;
@@ -33,6 +38,10 @@ const state = {
   fits: { scouted: null, plain: null }, // live fit objects the simulator needs
   scouting: null,
   result: null,
+  // "bundle" = the standings the export shipped (the CSV, when there is one);
+  // "rebuilt" = recomputed here from TBA's played matches.
+  standingsMode: "bundle",
+  rebuiltStandings: null,
   forced: {},
   sort: { key: "meanRank", dir: 1 },
   selected: null,
@@ -57,6 +66,8 @@ async function boot() {
   }
 
   $("cutoff").max = String(state.bundle.teams.length);
+  applyBundleHalfLife();
+  renderStandingsSource();
   await detectCapabilities();
   await loadScouting({ initial: true });
   await run();
@@ -111,10 +122,22 @@ async function loadScouting({ initial = false } = {}) {
 function refit(scoutingError = null) {
   const bundle = state.bundle;
   const weight = 1;
-  state.fits.plain = fitModel(bundle, { scouting: null });
+  const halfLife = Number($("half-life").value);
+  state.fits.plain = fitModel(bundle, { scouting: null, halfLife });
   state.fits.scouted = state.scouting
-    ? fitModel(bundle, { scouting: state.scouting, scoutingWeight: weight })
+    ? fitModel(bundle, { scouting: state.scouting, scoutingWeight: weight, halfLife })
     : state.fits.plain;
+  // The same fit with the decay off, so the model table can show what recency
+  // moved for each team the way it already does for scouting. A fit is ~8 ms.
+  const flat = halfLife > 0
+    ? fitModel(bundle, {
+        scouting: state.scouting,
+        scoutingWeight: weight,
+        halfLife: 0,
+      })
+    : state.fits.scouted;
+  const flatPlain =
+    halfLife > 0 ? fitModel(bundle, { scouting: null, halfLife: 0 }) : state.fits.plain;
 
   state.event = {
     eventKey: bundle.event.key,
@@ -127,8 +150,11 @@ function refit(scoutingError = null) {
     csvDiscrepancies: bundle.csvDiscrepancies,
     tbaSource: bundle.tbaSource,
     tbaWarnings: bundle.tbaWarnings,
+    standingsSource: bundle.standingsSource,
     fit: fitSummary(state.fits.scouted),
     fitPlain: fitSummary(state.fits.plain),
+    fitFlat: fitSummary(flat),
+    fitFlatPlain: fitSummary(flatPlain),
     scouting: state.scouting,
     scoutingError,
   };
@@ -152,6 +178,7 @@ function wireControls() {
   $("theme-btn").addEventListener("click", toggleTheme);
   $("refresh-btn").addEventListener("click", refreshScouting);
   $("tba-btn").addEventListener("click", refreshTba);
+  $("standings-btn").addEventListener("click", toggleStandings);
   $("scrim").addEventListener("click", closeDetail);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeDetail();
@@ -159,6 +186,26 @@ function wireControls() {
   for (const id of ["trials", "cutoff", "uncertainty", "scouting"]) {
     $(id).addEventListener("change", () => run());
   }
+  // Recency changes the fit itself, not just how it is sampled, so this one
+  // has to refit before it re-simulates.
+  $("half-life").addEventListener("change", () => {
+    refit(state.event ? state.event.scoutingError : null);
+    run();
+  });
+}
+
+// The bundle carries the half-life the CLI exported with, so the page starts on
+// the same model a `./sim.py report` would print. An exported value that is not
+// one of the offered steps gets an option of its own rather than being rounded.
+function applyBundleHalfLife() {
+  const select = $("half-life");
+  const exported = String(state.bundle.constants.recencyHalfLife ?? 0);
+  if (![...select.options].some((o) => o.value === exported)) {
+    const option = el("option", null, `${exported} matches`);
+    option.value = exported;
+    select.append(option);
+  }
+  select.value = exported;
 }
 
 function applyStoredTheme() {
@@ -199,6 +246,9 @@ async function run() {
     oprUncertainty: $("uncertainty").checked,
     useScouting: $("scouting").checked,
     forced: state.forced,
+    standings: activeStandings(),
+    standingsSource:
+      state.standingsMode === "rebuilt" ? "tba-matches" : state.bundle.standingsSource,
   };
   try {
     // Yield a frame so the dimmed "running" state actually paints before the
@@ -248,6 +298,9 @@ async function refreshTba() {
 
     const played = bundle.event.matchesPlayed - state.bundle.event.matchesPlayed;
     state.bundle = bundle;
+    // A newer pull means new matches to accumulate, so the rebuild has to be
+    // redone rather than reused -- and its check against TBA's table with it.
+    state.rebuiltStandings = null;
     // A forced what-if on a match that has since been played is meaningless.
     const stillRemaining = new Set(bundle.remaining.map((m) => m.key));
     for (const key of Object.keys(state.forced)) {
@@ -255,6 +308,7 @@ async function refreshTba() {
     }
 
     refit(state.event ? state.event.scoutingError : null);
+    renderStandingsSource();
 
     // Say what actually happened. The client falls back to its disk cache when
     // TBA is unreachable, so "refreshed" is not the same as "reached TBA".
@@ -303,6 +357,92 @@ async function refreshScouting() {
   }
 }
 
+/* --------------------------------------------------------- standings source */
+
+// Where the projection starts from. The bundle ships a snapshot of the current
+// standings -- for this event a hand-supplied CSV, exported whenever someone
+// last ran ./sim.py -- while TBA's match record is the live thing. Rebuilding
+// from the played matches is a full re-derivation of the ranking rules here in
+// the page (web/lib/standings.js), not a second table read off an endpoint,
+// which is why it can then be checked against TBA's published one.
+function rebuiltStandings() {
+  if (!state.rebuiltStandings) {
+    state.rebuiltStandings = buildStandings(state.bundle);
+    state.standingsCheck = verifyAgainstPublished(
+      state.rebuiltStandings,
+      state.bundle.tbaRankings
+    );
+    state.standingsDiff = diffStandings(
+      state.bundle.standings,
+      state.rebuiltStandings,
+      state.bundle.teams
+    );
+  }
+  return state.rebuiltStandings;
+}
+
+function activeStandings() {
+  return state.standingsMode === "rebuilt" ? rebuiltStandings() : state.bundle.standings;
+}
+
+function toggleStandings() {
+  state.standingsMode = state.standingsMode === "rebuilt" ? "bundle" : "rebuilt";
+  renderStandingsSource();
+  if (state.event) renderEventHeader();
+  run();
+}
+
+// Label the button by what pressing it does, and say what the switch changed.
+function renderStandingsSource() {
+  const btn = $("standings-btn");
+  const pill = $("standings-status");
+  const fromCsv = state.bundle.standingsSource === "csv";
+  const exported = fromCsv ? "the CSV" : "the exported standings";
+  const rebuilt = state.standingsMode === "rebuilt";
+  // Computed either way: the tooltip should say what the button would do
+  // before it is pressed, not only after.
+  rebuiltStandings();
+  const { changed, moved } = state.standingsDiff;
+  const check = state.standingsCheck;
+
+  btn.textContent = rebuilt
+    ? `Back to ${fromCsv ? "CSV" : "exported"} standings`
+    : "Use TBA standings";
+  btn.title = rebuilt
+    ? `Go back to the standings exported with the bundle (${exported})`
+    : "Rebuild the current standings here from TBA's played matches, and start " +
+      `the projection from those instead of ${exported}`;
+
+  if (!rebuilt) {
+    pill.classList.add("hidden");
+    return;
+  }
+  const parts = [];
+  parts.push(
+    changed.length
+      ? `${changed.length} team${changed.length > 1 ? "s" : ""} differ`
+      : `identical to ${exported}`
+  );
+  if (moved.length) parts.push(`${moved.length} rank change${moved.length > 1 ? "s" : ""}`);
+  if (check.checked) parts.push(check.agrees ? "matches TBA" : "differs from TBA");
+  pill.textContent = parts.join(" · ");
+  pill.classList.toggle("pill-warn", check.checked && !check.agrees);
+  pill.classList.remove("hidden");
+  pill.title = check.checked
+    ? check.agrees
+      ? "Rebuilt standings agree with TBA's published rankings, team for team"
+      : `Disagrees with TBA's published rankings: ${check.mismatches.join("; ")}`
+    : "TBA has published no rankings for this event to check against";
+
+  if (check.checked && !check.agrees) {
+    showNotice(
+      "Standings rebuilt from the match breakdowns disagree with TBA's published " +
+        `rankings: ${check.mismatches.slice(0, 4).join("; ")}` +
+        (check.mismatches.length > 4 ? ` (+${check.mismatches.length - 4} more)` : "")
+    );
+  }
+}
+
 function relativeTime(ms) {
   if (!ms) return "unknown";
   const mins = Math.round((Date.now() - ms) / 60000);
@@ -330,6 +470,11 @@ function renderEventHeader() {
         `(${ev.scouting.totalReports} reports)`
     );
   }
+  parts.push(
+    state.standingsMode === "rebuilt"
+      ? "standings rebuilt from TBA matches"
+      : `standings from ${ev.standingsSource === "csv" ? "the CSV" : "TBA matches"}`
+  );
   $("event-sub").textContent = parts.join(" · ");
   const notes = [];
   if (Object.keys(ev.csvAliases || {}).length) {
@@ -820,11 +965,23 @@ function closeDetail() {
 
 function renderModelTable() {
   const fit = activeFit();
+  const useScouting = state.result ? state.result.meta.useScouting : true;
   const plain = state.event.fitPlain;
+  // Same model as the active one, minus the recency decay -- so the Δ column
+  // isolates recency rather than mixing it with the scouting toggle.
+  const flat = useScouting ? state.event.fitFlat : state.event.fitFlatPlain;
   const scouting = state.event.scouting;
 
+  const rec = fit.recency;
+  const appearances = rec && rec.applied
+    ? `${fit.observations} alliance appearances, ` +
+      `discounted by recency to ${rec.effectiveObservations.toFixed(1)} effective ` +
+      `(half-life ${rec.halfLife} matches: the oldest counts ${rec.oldestWeight.toFixed(2)} ` +
+      `against the newest at ${rec.newestWeight.toFixed(2)})`
+    : `${fit.observations} alliance appearances, every match weighted equally`;
+
   let summary =
-    `Ridge-regularised OPR on ${fit.observations} alliance appearances · ` +
+    `Ridge-regularised OPR on ${appearances} · ` +
     `R² ${fit.rSquared.toFixed(3)} · residual σ ${fit.sigmaHub.toFixed(1)} hub points · ` +
     `RP thresholds: energized ≥ ${fit.thresholds.energized} hub, ` +
     `supercharged ≥ ${fit.thresholds.supercharged} hub, ` +
@@ -851,10 +1008,16 @@ function renderModelTable() {
     tr.append(el("td", "", m.hubOpr.toFixed(1)));
     tr.append(el("td", "muted", m.hubSe.toFixed(1)));
 
-    const delta = m.hubOpr - (plain.teams[team] ? plain.teams[team].hubOpr : m.hubOpr);
-    const dcell = el("td", Math.abs(delta) < 0.05 ? "muted" : "");
-    dcell.textContent = Math.abs(delta) < 0.05 ? "—" : (delta > 0 ? "+" : "") + delta.toFixed(1);
-    tr.append(dcell);
+    const deltaCell = (from) => {
+      const base = from.teams[team] ? from.teams[team].hubOpr : m.hubOpr;
+      const delta = m.hubOpr - base;
+      const cell = el("td", Math.abs(delta) < 0.05 ? "muted" : "");
+      cell.textContent =
+        Math.abs(delta) < 0.05 ? "—" : (delta > 0 ? "+" : "") + delta.toFixed(1);
+      return cell;
+    };
+    tr.append(deltaCell(plain));
+    tr.append(deltaCell(flat));
 
     const st = scouting ? scouting.teams[team] : null;
     const scell = el("td", st && st.reports ? "" : "muted");

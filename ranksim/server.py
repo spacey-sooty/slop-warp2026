@@ -45,12 +45,17 @@ class RefreshService:
     """Re-pulls TBA and rewrites the bundle. Serialised: the button is cheap to
     spam, and two concurrent pulls would race on the same file."""
 
-    def __init__(self, event_key, csv_path, ridge, scouting_url, out=BUNDLE_PATH):
+    def __init__(
+        self, event_key, csv_path, ridge, scouting_url, out=BUNDLE_PATH, half_life=None
+    ):
+        from .model import DEFAULT_HALF_LIFE
+
         self.event_key = event_key
         self.csv_path = csv_path
         self.ridge = ridge
         self.scouting_url = scouting_url
         self.out = Path(out)
+        self.half_life = DEFAULT_HALF_LIFE if half_life is None else half_life
         self.lock = threading.Lock()
 
     def refresh(self) -> dict:
@@ -66,6 +71,7 @@ class RefreshService:
                 ridge=self.ridge,
                 scouting_url=self.scouting_url,
                 generated_at=time.time(),
+                half_life=self.half_life,
             )
             self.out.parent.mkdir(parents=True, exist_ok=True)
             self.out.write_text(json.dumps(payload, separators=(",", ":")))

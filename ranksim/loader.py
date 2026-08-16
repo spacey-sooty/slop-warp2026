@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .event import EventState, build_state
-from .model import Fit, fit as fit_model
+from .event import EventState, build_state, parse_rankings
+from .model import DEFAULT_HALF_LIFE, Fit, fit as fit_model
 from .scouting import DEFAULT_URL as SCOUTING_URL, Scouting, ScoutingError
 from .scouting import load as load_scouting_data
 from .tba import CACHE_DIR, TBAClient
@@ -30,9 +30,20 @@ def load_event(
     except Exception:
         name = event_key
     matches = client.matches(event_key, force=refresh)
+    # Whether *the results* reached TBA is what the page reports, so it is read
+    # here rather than after the rankings pull below -- a cache hit on the
+    # cross-check must not make a live results pull look stale.
+    matches_source = client.last_source
     csv_path = DEFAULT_CSV if csv_path is None else Path(csv_path)
     state = build_state(event_key, name, matches, csv_path)
-    state.tba_source = client.last_source
+    # A cross-check, not an input: a missing or unreachable rankings endpoint
+    # (an event that has published none yet, an offline run with a cold cache)
+    # costs the comparison and nothing else.
+    try:
+        state.tba_rankings = parse_rankings(client.rankings(event_key, force=refresh))
+    except Exception:
+        state.tba_rankings = None
+    state.tba_source = matches_source
     state.tba_warnings = list(client.warnings)
     return state
 
@@ -64,7 +75,12 @@ def load_fit(
     ridge: float = 3.0,
     scouting: Scouting | None = None,
     scouting_weight: float = 1.0,
+    half_life: float = DEFAULT_HALF_LIFE,
 ) -> Fit:
     return fit_model(
-        state, ridge=ridge, scouting=scouting, scouting_weight=scouting_weight
+        state,
+        ridge=ridge,
+        scouting=scouting,
+        scouting_weight=scouting_weight,
+        half_life=half_life,
     )

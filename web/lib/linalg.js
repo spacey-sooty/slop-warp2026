@@ -52,17 +52,19 @@ export function cholInvDiag(lower) {
   return diag;
 }
 
-// Build (X'X + ridge*I, X'y) from sparse rows of column indices. Every design
-// row is an alliance: three 1s and the rest zeros.
-export function normalEquations(rows, y, nCols, ridge) {
+// Build (X'WX + ridge*I, X'Wy) from sparse rows of column indices. Every design
+// row is an alliance: three 1s and the rest zeros. W is the diagonal of per-row
+// weights (recency); without it every row counts once.
+export function normalEquations(rows, y, nCols, ridge, weights) {
   const ata = Array.from({ length: nCols }, () => new Float64Array(nCols));
   const aty = new Float64Array(nCols);
   for (let r = 0; r < rows.length; r++) {
     const cols = rows[r];
     const target = y[r];
+    const w = weights ? weights[r] : 1;
     for (const i of cols) {
-      aty[i] += target;
-      for (const j of cols) ata[i][j] += 1;
+      aty[i] += w * target;
+      for (const j of cols) ata[i][j] += w;
     }
   }
   for (let i = 0; i < nCols; i++) ata[i][i] += ridge;

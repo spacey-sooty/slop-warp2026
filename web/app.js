@@ -404,10 +404,35 @@ function renderStandingsSource() {
   rebuiltStandings();
   const { changed, moved } = state.standingsDiff;
   const check = state.standingsCheck;
+  const verdict = !check.checked
+    ? "no TBA rankings to check against"
+    : check.agrees
+    ? "matches TBA"
+    : "differs from TBA";
 
-  btn.textContent = rebuilt
-    ? `Back to ${fromCsv ? "CSV" : "exported"} standings`
-    : "Use TBA standings";
+  // A bundle exported without a standings CSV -- which is every deployed build,
+  // since the CSV lives outside the repo -- already carries the rebuild as its
+  // standings. There is nothing to switch to, and a button that cannot change
+  // anything reads as a broken one, so say what is in force instead of offering
+  // the toggle.
+  if (!fromCsv) {
+    state.standingsMode = "bundle";
+    btn.disabled = true;
+    btn.textContent = "Standings: TBA matches";
+    btn.title =
+      "No standings CSV shipped with this bundle, so the standings already are " +
+      `the ${state.bundle.event.matchesPlayed} played matches worked through the ` +
+      "ranking rules. Nothing to switch to.";
+    pill.textContent = `${state.bundle.event.matchesPlayed} matches · ${verdict}`;
+    pill.classList.toggle("pill-warn", check.checked && !check.agrees);
+    pill.classList.remove("hidden");
+    pill.title = standingsCheckTitle(check);
+    if (check.checked && !check.agrees) noticeDisagreement(check);
+    return;
+  }
+
+  btn.disabled = false;
+  btn.textContent = rebuilt ? "Back to CSV standings" : "Use TBA standings";
   btn.title = rebuilt
     ? `Go back to the standings exported with the bundle (${exported})`
     : "Rebuild the current standings here from TBA's played matches, and start " +
@@ -424,23 +449,28 @@ function renderStandingsSource() {
       : `identical to ${exported}`
   );
   if (moved.length) parts.push(`${moved.length} rank change${moved.length > 1 ? "s" : ""}`);
-  if (check.checked) parts.push(check.agrees ? "matches TBA" : "differs from TBA");
+  if (check.checked) parts.push(verdict);
   pill.textContent = parts.join(" · ");
   pill.classList.toggle("pill-warn", check.checked && !check.agrees);
   pill.classList.remove("hidden");
-  pill.title = check.checked
-    ? check.agrees
-      ? "Rebuilt standings agree with TBA's published rankings, team for team"
-      : `Disagrees with TBA's published rankings: ${check.mismatches.join("; ")}`
-    : "TBA has published no rankings for this event to check against";
+  pill.title = standingsCheckTitle(check);
+  if (check.checked && !check.agrees) noticeDisagreement(check);
+}
 
-  if (check.checked && !check.agrees) {
-    showNotice(
-      "Standings rebuilt from the match breakdowns disagree with TBA's published " +
-        `rankings: ${check.mismatches.slice(0, 4).join("; ")}` +
-        (check.mismatches.length > 4 ? ` (+${check.mismatches.length - 4} more)` : "")
-    );
-  }
+function standingsCheckTitle(check) {
+  if (!check.checked) return "TBA has published no rankings for this event to check against";
+  return check.agrees
+    ? "Standings rebuilt from the match breakdowns agree with TBA's published " +
+        "rankings, team for team"
+    : `Disagrees with TBA's published rankings: ${check.mismatches.join("; ")}`;
+}
+
+function noticeDisagreement(check) {
+  showNotice(
+    "Standings rebuilt from the match breakdowns disagree with TBA's published " +
+      `rankings: ${check.mismatches.slice(0, 4).join("; ")}` +
+      (check.mismatches.length > 4 ? ` (+${check.mismatches.length - 4} more)` : "")
+  );
 }
 
 function relativeTime(ms) {

@@ -192,6 +192,19 @@ rank positions moved — because most of the time the answer is "nothing", and t
 one time it is not, that is exactly what you want to see before reading the
 projection.
 
+**On the deployed site there is nothing to switch to.** The CSV lives outside
+the repo, so a CI build never has one and its standings already *are* the
+rebuild. There the button is disabled and reads `Standings: TBA matches`, with
+the check beside it (`37 matches · matches TBA`) — a button that cannot change
+anything is indistinguishable from a broken one, so it says what is in force
+instead. The toggle is live wherever a CSV was attached, which means local runs.
+
+Worth knowing when the two disagree: a team's ranking score is RP ÷ matches
+played, so **losing a match drops it even though no RP is lost**. 4788B sat 6th
+on 17 RP from 7 matches (2.43) and fell to 8th on the same 17 RP from 8 (2.13)
+the moment their eighth match was scored. A snapshot taken before that match
+will disagree with the rebuild, and the rebuild is the one that is right.
+
 **TBA computes the same table from the same matches, so the rebuild is checked
 against it.** The published rankings ride along in the bundle as `tbaRankings`
 purely as a reference: the page compares its own rebuild — order, plus each

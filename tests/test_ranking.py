@@ -340,8 +340,12 @@ class StandingsSource(unittest.TestCase):
                 self.assertEqual(len(result["teams"]), len(self.state.teams))
 
     def test_tba_base_ignores_the_csv(self):
-        """A stale CSV must not leak into the rebuilt-from-matches projection."""
-        stale = {t: r.copy() for t, r in self.state.csv_records.items()}
+        """A stale CSV must not leak into the rebuilt-from-matches projection.
+
+        The snapshot is fabricated from the match records rather than read from
+        the CSV: that file lives outside the repo, so CI runs without one.
+        """
+        stale = {t: r.copy() for t, r in self.state.records.items()}
         for record in stale.values():
             record.rp += 50
         self.state.csv_records = stale
